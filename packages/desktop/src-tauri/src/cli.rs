@@ -22,20 +22,18 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::server::get_wsl_config;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
-// Keep this as a custom wrapper instead of process_wrap::CreationFlags.
-// JobObject pre_spawn rewrites creation flags, so this must run after it.
-struct WinCreationFlags;
+struct HideConsole;
 
 #[cfg(windows)]
-impl CommandWrapper for WinCreationFlags {
+impl CommandWrapper for HideConsole {
     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> std::io::Result<()> {
-        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+        command.creation_flags(CREATE_NO_WINDOW);
         Ok(())
     }
 }
@@ -124,7 +122,7 @@ fn is_cli_installed() -> bool {
         .unwrap_or(false)
 }
 
-const INSTALL_SCRIPT: &str = include_str!("../../../../install");
+const INSTALL_SCRIPT: &str = include_str!("install.sh");
 
 #[tauri::command]
 #[specta::specta]
@@ -474,7 +472,7 @@ pub fn spawn_command(
 
     #[cfg(windows)]
     {
-        wrap.wrap(JobObject).wrap(WinCreationFlags).wrap(KillOnDrop);
+        wrap.wrap(JobObject).wrap(HideConsole).wrap(KillOnDrop);
     }
 
     let mut child = wrap.spawn()?;
@@ -482,18 +480,19 @@ pub fn spawn_command(
     let (tx, rx) = mpsc::channel(256);
     let (kill_tx, mut kill_rx) = mpsc::channel(1);
 
-    let stdout = spawn_pipe_reader(
+    let mut pipe_handles: Vec<JoinHandle<()>> = vec![];
+    pipe_handles.push(spawn_pipe_reader(
         tx.clone(),
         guard.clone(),
         BufReader::new(child.stdout().take().unwrap()),
         CommandEvent::Stdout,
-    );
-    let stderr = spawn_pipe_reader(
+    ));
+    pipe_handles.push(spawn_pipe_reader(
         tx.clone(),
         guard.clone(),
         BufReader::new(child.stderr().take().unwrap()),
         CommandEvent::Stderr,
-    );
+    ));
 
     tokio::task::spawn(async move {
         let mut kill_open = true;
@@ -528,8 +527,9 @@ pub fn spawn_command(
             }
         }
 
-        stdout.abort();
-        stderr.abort();
+        for h in pipe_handles {
+            h.abort();
+        }
     });
 
     let event_stream = ReceiverStream::new(rx);

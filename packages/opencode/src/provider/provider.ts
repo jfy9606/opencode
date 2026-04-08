@@ -11,6 +11,7 @@ import { Plugin } from "../plugin"
 import { NamedError } from "@opencode-ai/util/error"
 import { type LanguageModelV3 } from "@ai-sdk/provider"
 import { ModelsDev } from "./models"
+import { WEB_PROVIDERS, ZERO_COST } from "./web"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { Instance } from "../project/instance"
@@ -672,26 +673,13 @@ export namespace Provider {
         }
       }),
       "cloudflare-workers-ai": Effect.fnUntraced(function* (input: Info) {
-        // When baseURL is already configured (e.g. corporate config routing through a proxy/gateway),
-        // skip the account ID check because the URL is already fully specified.
-        if (input.options?.baseURL) return { autoload: false }
-
-        const auth = yield* dep.auth(input.id)
-        const accountId =
-          Env.get("CLOUDFLARE_ACCOUNT_ID") || (auth?.type === "api" ? auth.metadata?.accountId : undefined)
-        if (!accountId)
-          return {
-            autoload: false,
-            async getModel() {
-              throw new Error(
-                "CLOUDFLARE_ACCOUNT_ID is missing. Set it with: export CLOUDFLARE_ACCOUNT_ID=<your-account-id>",
-              )
-            },
-          }
+        const accountId = Env.get("CLOUDFLARE_ACCOUNT_ID")
+        if (!accountId) return { autoload: false }
 
         const apiKey = yield* Effect.gen(function* () {
           const envToken = Env.get("CLOUDFLARE_API_KEY")
           if (envToken) return envToken
+          const auth = yield* dep.auth(input.id)
           if (auth?.type === "api") return auth.key
           return undefined
         })
@@ -715,34 +703,16 @@ export namespace Provider {
         }
       }),
       "cloudflare-ai-gateway": Effect.fnUntraced(function* (input: Info) {
-        // When baseURL is already configured (e.g. corporate config), skip the ID checks.
-        if (input.options?.baseURL) return { autoload: false }
+        const accountId = Env.get("CLOUDFLARE_ACCOUNT_ID")
+        const gateway = Env.get("CLOUDFLARE_GATEWAY_ID")
 
-        const auth = yield* dep.auth(input.id)
-        const accountId =
-          Env.get("CLOUDFLARE_ACCOUNT_ID") || (auth?.type === "api" ? auth.metadata?.accountId : undefined)
-        const gateway =
-          Env.get("CLOUDFLARE_GATEWAY_ID") || (auth?.type === "api" ? auth.metadata?.gatewayId : undefined)
-
-        if (!accountId || !gateway) {
-          const missing = [
-            !accountId ? "CLOUDFLARE_ACCOUNT_ID" : undefined,
-            !gateway ? "CLOUDFLARE_GATEWAY_ID" : undefined,
-          ].filter((x): x is string => Boolean(x))
-          return {
-            autoload: false,
-            async getModel() {
-              throw new Error(
-                `${missing.join(" and ")} missing. Set with: ${missing.map((x) => `export ${x}=<value>`).join(" && ")}`,
-              )
-            },
-          }
-        }
+        if (!accountId || !gateway) return { autoload: false }
 
         // Get API token from env or auth - required for authenticated gateways
         const apiToken = yield* Effect.gen(function* () {
           const envToken = Env.get("CLOUDFLARE_API_TOKEN") || Env.get("CF_AIG_TOKEN")
           if (envToken) return envToken
+          const auth = yield* dep.auth(input.id)
           if (auth?.type === "api") return auth.key
           return undefined
         })
@@ -1016,6 +986,48 @@ export namespace Provider {
           const cfg = yield* config.get()
           const modelsDev = yield* Effect.promise(() => ModelsDev.get())
           const database = mapValues(modelsDev, fromModelsDevProvider)
+
+          for (const [providerID, wp] of Object.entries(WEB_PROVIDERS)) {
+            database[ProviderID.make(providerID) as ProviderID] = {
+              id: ProviderID.make(providerID),
+              name: wp.name,
+              source: "custom",
+              env: [],
+              options: {},
+              models: Object.fromEntries(
+                wp.models.map((m) => [
+                  m.id,
+                  {
+                    id: ModelID.make(m.id),
+                    providerID: ProviderID.make(providerID),
+                    name: m.name,
+                    api: {
+                      id: m.id,
+                      npm: "@ai-sdk/openai-compatible",
+                      url: `/provider/${providerID}`,
+                    },
+                    status: "active" as const,
+                    capabilities: {
+                      temperature: true,
+                      reasoning: m.reasoning,
+                      attachment: m.input.includes("image"),
+                      toolcall: true,
+                      input: { text: m.input.includes("text"), audio: false, image: m.input.includes("image"), video: false, pdf: false },
+                      output: { text: true, audio: false, image: false, video: false, pdf: false },
+                      interleaved: false,
+                    },
+                    cost: { input: ZERO_COST.input, output: ZERO_COST.output, cache: { read: ZERO_COST.cacheRead, write: ZERO_COST.cacheWrite } },
+                    limit: { context: m.contextWindow, input: undefined, output: m.maxTokens },
+                    headers: {},
+                    options: {},
+                    variants: {},
+                    family: "",
+                    release_date: "",
+                  },
+                ]),
+              ),
+            }
+          }
 
           const providers: Record<ProviderID, Info> = {} as Record<ProviderID, Info>
           const languages = new Map<string, LanguageModelV3>()
@@ -1318,6 +1330,21 @@ export namespace Provider {
             log.info("found", { providerID })
           }
 
+          for (const pid of Object.keys(WEB_PROVIDERS)) {
+            const providerID = ProviderID.make(pid)
+            if (!isProviderAllowed(providerID)) continue
+            const stored = yield* auth.get(providerID).pipe(Effect.orDie)
+            if (stored) mergeProvider(providerID, { source: "custom" })
+            modelLoaders[providerID] = async (sdk: any, modelID: string, options?: Record<string, any>) => {
+              const origin = (globalThis as any).__opencodeServerOrigin as string | undefined
+              return createOpenAICompatible({
+                name: providerID,
+                apiKey: "web-provider",
+                baseURL: origin ? `${origin}/provider/${pid}` : `http://127.0.0.1/provider/${pid}`,
+              }).chatModel(modelID)
+            }
+          }
+
           return {
             models: languages,
             providers,
@@ -1346,7 +1373,7 @@ export namespace Provider {
             options["includeUsage"] = true
           }
 
-          const baseURL = iife(() => {
+          let baseURL = iife(() => {
             let url =
               typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
             if (!url) return
@@ -1366,6 +1393,11 @@ export namespace Provider {
             })
             return url
           })
+
+          if (baseURL?.startsWith("/")) {
+            const origin = (globalThis as any).__opencodeServerOrigin as string | undefined
+            if (origin) baseURL = `${origin}${baseURL}`
+          }
 
           if (baseURL !== undefined) options["baseURL"] = baseURL
           if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key

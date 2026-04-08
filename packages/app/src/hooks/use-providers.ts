@@ -12,6 +12,19 @@ export const popularProviders = [
   "google",
   "openrouter",
   "vercel",
+  "chatgpt-web",
+  "claude-web",
+  "deepseek-web",
+  "doubao-web",
+  "qwen-web",
+  "qwen-cn-web",
+  "kimi-web",
+  "gemini-web",
+  "grok-web",
+  "glm-web",
+  "glm-intl-web",
+  "perplexity-web",
+  "xiaomimo-web",
 ]
 const popularProviderSet = new Set(popularProviders)
 

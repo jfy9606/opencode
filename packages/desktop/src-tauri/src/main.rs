@@ -40,6 +40,7 @@ fn configure_display_backend() -> Option<String> {
 }
 
 fn main() {
+
     // Ensure loopback connections are never sent through proxy settings.
     // Some VPNs/proxies set HTTP_PROXY/HTTPS_PROXY/ALL_PROXY without excluding localhost.
     const LOOPBACK: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
