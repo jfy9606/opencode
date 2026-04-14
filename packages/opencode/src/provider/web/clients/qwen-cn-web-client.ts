@@ -1,3 +1,5 @@
+import crypto from "node:crypto"
+
 const QWEN_CN_API_BASE = "https://chat2.qianwen.com"
 
 export class QwenCNWebClient {

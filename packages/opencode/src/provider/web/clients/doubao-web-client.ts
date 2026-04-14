@@ -1,3 +1,5 @@
+import crypto from "node:crypto"
+
 const DOUBAO_API_BASE = "https://www.doubao.com"
 
 export class DoubaoWebClient {

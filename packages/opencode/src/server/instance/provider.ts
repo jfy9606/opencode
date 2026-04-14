@@ -28,6 +28,7 @@ import { mapValues } from "remeda"
 import { errors } from "../error"
 import { lazy } from "../../util/lazy"
 import { Log } from "../../util/log"
+import { Effect } from "effect"
 
 const log = Log.create({ service: "server" })
 
@@ -57,22 +58,31 @@ export const ProviderRoutes = lazy(() =>
         },
       }),
       async (c) => {
-        const config = await Config.get()
-        const disabled = new Set(config.disabled_providers ?? [])
-        const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
-
-        const allProviders = await ModelsDev.get()
-        const filteredProviders: Record<string, (typeof allProviders)[string]> = {}
-        for (const [key, value] of Object.entries(allProviders)) {
-          if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) {
-            filteredProviders[key] = value
-          }
-        }
-
-        const connected = await Provider.list()
-        const providers = Object.assign(
-          mapValues(filteredProviders, (x) => Provider.fromModelsDevProvider(x)),
-          connected,
+        const result = await AppRuntime.runPromise(
+          Effect.gen(function* () {
+            const svc = yield* Provider.Service
+            const cfg = yield* Config.Service
+            const config = yield* cfg.get()
+            const all = yield* Effect.promise(() => ModelsDev.get())
+            const disabled = new Set(config.disabled_providers ?? [])
+            const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
+            const filtered: Record<string, (typeof all)[string]> = {}
+            for (const [key, value] of Object.entries(all)) {
+              if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) {
+                filtered[key] = value
+              }
+            }
+            const connected = yield* svc.list()
+            const providers = Object.assign(
+              mapValues(filtered, (x) => Provider.fromModelsDevProvider(x)),
+              connected,
+            )
+            return {
+              all: Object.values(providers),
+              default: mapValues(providers, (item) => Provider.sort(Object.values(item.models))[0].id),
+              connected: Object.keys(connected),
+            }
+          }),
         )
 
         for (const [id, wp] of Object.entries(WEB_PROVIDERS)) {
@@ -126,9 +136,9 @@ export const ProviderRoutes = lazy(() =>
         }
 
         return c.json({
-          all: Object.values(providers),
-          default: mapValues(providers, (item) => Provider.sort(Object.values(item.models))[0].id),
-          connected: connectedKeys,
+          all: result.all,
+          default: result.default,
+          connected: result.connected,
         })
       },
     )

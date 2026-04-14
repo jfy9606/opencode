@@ -1,3 +1,5 @@
+import crypto from "node:crypto"
+
 const GROK_BASE = "https://grok.com"
 
 export class GrokWebClient {
