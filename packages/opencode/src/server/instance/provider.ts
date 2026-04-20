@@ -378,7 +378,7 @@ export const ProviderRoutes = lazy(() =>
 
         log.info(`[WebChat] ${providerID} model=${model} stream=${stream} msgs=${messages.length} tools=${tools.length}`)
 
-        const prompt = buildWebPrompt(messages, tools)
+        const prompt = buildWebPrompt(messages, tools, providerID)
 
         try {
           if (stream) {
@@ -395,24 +395,89 @@ export const ProviderRoutes = lazy(() =>
     ),
   )
 
-function buildWebPrompt(messages: any[], tools: any[]): string {
+function buildToolDefs(tools: any[]): string {
+  const defs: Array<{ name: string; description: string; parameters: Record<string, string> }> = []
+  for (const t of tools) {
+    const fn = t.function ?? t
+    const params: Record<string, string> = {}
+    if (fn.parameters?.properties) {
+      for (const [k, v] of Object.entries(fn.parameters.properties)) {
+        params[k] = (v as any).type ?? "string"
+      }
+    }
+    defs.push({ name: fn.name, description: fn.description ?? "", parameters: params })
+  }
+  return JSON.stringify(defs)
+}
+
+const TOOL_EXAMPLE = `Example: to add 1 to number 5, return:
+\`\`\`tool_json
+{"tool":"plus_one","parameters":{"number":"5"}}
+\`\`\`
+(plus_one is just an example, not a real tool)`
+
+function getToolPrompt(tools: any[], providerID: string): string {
+  const defs = buildToolDefs(tools)
+  const cnModels = new Set(["deepseek-web", "doubao-web", "qwen-cn-web", "kimi-web", "glm-web", "glm-intl-web", "xiaomimo-web"])
+  const strictModels = new Set(["chatgpt-web"])
+
+  if (cnModels.has(providerID)) {
+    return `工具: ${defs}
+
+示例: 要给数字5加1，返回:
+\`\`\`tool_json
+{"tool":"plus_one","parameters":{"number":"5"}}
+\`\`\`
+(plus_one仅为示例，非真实工具)
+
+你的真实工具见上方列表。需要时只回复tool_json块。不需要则直接回答。
+
+`
+  }
+
+  if (strictModels.has(providerID)) {
+    return `Tools: ${defs}
+
+${TOOL_EXAMPLE}
+
+Your actual tools are listed above. To use one, reply ONLY with the tool_json block. No extra text.
+No tool needed? Answer directly.
+
+`
+  }
+
+  return `Tools: ${defs}
+
+${TOOL_EXAMPLE}
+
+Your actual tools are listed above. To use one, reply ONLY with the tool_json block.
+No tool needed? Answer directly.
+
+`
+}
+
+const TOOL_KEYWORDS = [
+  "文件", "file", "read", "write", "创建", "写入", "读取", "打开", "保存",
+  "desktop", "目录", "directory", "folder", "文件夹",
+  "执行", "运行", "命令", "command", "run", "exec", "terminal", "终端", "shell",
+  "搜索", "search", "查找", "查询", "fetch", "抓取", "网页", "url", "http",
+  "下载", "download", "安装", "install", "更新", "update",
+  "帮我", "help me", "查看", "check", "look", "看看", "show",
+]
+
+function needsTools(message: string): boolean {
+  const lower = message.toLowerCase()
+  return TOOL_KEYWORDS.some((kw) => lower.includes(kw))
+}
+
+const EXCLUDED_FROM_TOOLS = new Set(["perplexity-web"])
+
+function buildWebPrompt(messages: any[], tools: any[], providerID: string): string {
   const parts: string[] = []
   let hasSystem = false
-  let toolSection = ""
 
-  if (tools.length > 0) {
-    const toolDefs: string[] = []
-    for (const t of tools) {
-      const fn = t.function ?? t
-      let def = "### " + fn.name + "\n"
-      if (fn.description) def += fn.description + "\n"
-      if (fn.parameters?.properties && Object.keys(fn.parameters.properties).length > 0) {
-        def += "Parameters (JSON schema):\n```json\n" + JSON.stringify(fn.parameters, null, 2) + "\n```\n"
-      }
-      toolDefs.push(def)
-    }
-    toolSection = "\n## Available Tools\n\nYou have access to the following tools. When you need to use one, respond with this exact XML format:\n\n<tool_call id=\"call_N\" name=\"TOOL_NAME\">\n{\"param1\": \"value1\", \"param2\": \"value2\"}\n\n" + toolDefs.join("\n") + "After using a tool, wait for the <tool_call> before continuing.\n"
-  }
+  const hasTools = tools.length > 0 && !EXCLUDED_FROM_TOOLS.has(providerID)
+  const toolPrompt = hasTools ? getToolPrompt(tools, providerID) : ""
 
   for (const msg of messages) {
     if (msg.role === "system") {
@@ -421,7 +486,6 @@ function buildWebPrompt(messages: any[], tools: any[]): string {
       if (Array.isArray(msg.content)) {
         sys = msg.content.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n")
       }
-      if (toolSection) sys += "\n\n" + toolSection
       parts.push(sys)
       continue
     }
@@ -436,14 +500,14 @@ function buildWebPrompt(messages: any[], tools: any[]): string {
           if ((part as any).type === "text" && part.text) texts.push(part.text)
           else if ((part as any).type === "tool-call") {
             const tc = part as any
-            calls.push("<tool_call id=\"" + tc.toolCallId + "\" name=\"" + tc.toolName + "\">" + (typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input)) + "</tool_call>")
+            calls.push(`\`\`\`tool_json\n{"tool":"${tc.toolName}","parameters":${typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input ?? {})}}\n\`\`\``)
           } else if ((part as any).type?.startsWith("tool-")) {
             const tp = part as any
             if (tp.state === "output-available" || tp.state === "output-error") {
               const outText = tp.state === "output-error"
                 ? "[Error] " + (tp.errorText ?? "")
                 : (typeof tp.output === "string" ? tp.output : JSON.stringify(tp.output ?? ""))
-              parts.push("<tool_response id=\"" + tp.toolCallId + "\" name=\"" + tp.tool + "\">\n" + outText + "\n\n")
+              parts.push(`Tool ${tp.tool ?? "unknown"} returned: ${outText}`)
             }
           }
         }
@@ -451,7 +515,7 @@ function buildWebPrompt(messages: any[], tools: any[]): string {
 
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
-          calls.push("<tool_call id=\"" + tc.id + "\" name=\"" + tc.function.name + "\">" + tc.function.arguments)
+          calls.push(`\`\`\`tool_json\n{"tool":"${tc.function.name}","parameters":${tc.function.arguments}}\n\`\`\``)
         }
       }
       if (texts.length || calls.length) {
@@ -468,9 +532,8 @@ function buildWebPrompt(messages: any[], tools: any[]): string {
         resultText = tr?.text ?? JSON.stringify(msg.content)
       } else resultText = JSON.stringify(msg.content)
 
-      const toolId = msg.tool_call_id || msg.toolCallId || msg.name || "unknown"
       const toolName = msg.name || ""
-      parts.push("<tool_response id=\"" + toolId + "\" name=\"" + toolName + "\">\n" + resultText + "\n\n")
+      parts.push(`Tool ${toolName || "unknown"} returned: ${resultText}`)
       continue
     }
 
@@ -492,10 +555,22 @@ function buildWebPrompt(messages: any[], tools: any[]): string {
     }
   }
 
-  if (!hasSystem && toolSection) parts.unshift(toolSection)
+  const joined = parts.join("\n\n")
+  if (!hasTools) return joined
 
-  return parts.join("\n\n")
+  const lastUserMsg = [...messages].reverse().find((m) => m.role === "user")
+  const userText = lastUserMsg
+    ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content :
+       Array.isArray(lastUserMsg.content) ? lastUserMsg.content.filter((p: any) => p.type === "text").map((p: any) => p.text).join("") : "")
+    : ""
+
+  if (userText && needsTools(userText)) {
+    return toolPrompt + "\n\n" + joined
+  }
+
+  return joined
 }
+
 
 function extractUserText(messages: any[]): string {
   const parts: string[] = []
@@ -507,6 +582,48 @@ function extractUserText(messages: any[]): string {
     }
   }
   return parts.join("\n")
+}
+
+interface ParsedToolCall { tool: string; parameters: Record<string, unknown> }
+
+const FENCED_TOOL_REGEX = /```tool_json\s*\n?\s*(\{[\s\S]*?\})\}?\s*\n?\s*```/
+const BARE_TOOL_REGEX = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*(\{[\s\S]*?\})\s*\}/
+const XML_TOOL_REGEX = /<tool_call[^>]*>([\s\S]*?)<\/tool_call>/
+
+function extractToolCall(text: string): ParsedToolCall | null {
+  const fenced = FENCED_TOOL_REGEX.exec(text)
+  if (fenced) return parseToolJson(fenced[1])
+
+  const bare = BARE_TOOL_REGEX.exec(text)
+  if (bare) {
+    try { return { tool: bare[1], parameters: JSON.parse(bare[2]) } }
+    catch { return null }
+  }
+
+  const xml = XML_TOOL_REGEX.exec(text)
+  if (xml) return parseToolJson(xml[1])
+
+  const fuzzy = text.match(/\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*\{([^}]*)\}/)
+  if (fuzzy) {
+    const repaired = `{"tool":"${fuzzy[1]}","parameters":{${fuzzy[2]}}}`
+    const result = parseToolJson(repaired)
+    if (result) return result
+  }
+
+  return null
+}
+
+function parseToolJson(raw: string): ParsedToolCall | null {
+  try {
+    let cleaned = raw.trim()
+    const opens = (cleaned.match(/\{/g) || []).length
+    const closes = (cleaned.match(/\}/g) || []).length
+    if (opens > closes) cleaned += "}".repeat(opens - closes)
+    const obj = JSON.parse(cleaned)
+    if (obj.tool && typeof obj.tool === "string") return { tool: obj.tool, parameters: obj.parameters ?? {} }
+    if (obj.name && typeof obj.name === "string") return { tool: obj.name, parameters: obj.arguments ?? {} }
+    return null
+  } catch { return null }
 }
 
 async function proxyStream(
@@ -610,9 +727,12 @@ async function proxyStreamWithTools(
   const reader = body.getReader()
   let buffer = ""
   let tagBuffer = ""
+  let accumulatedText = ""
   const hasTools = _tools && _tools.length > 0
   let inToolCall = false
   let toolIndex = 0
+  let toolCallEmitted = false
+  let currentTid = ""
 
   const flushText = (text: string) => {
     if (!text) return
@@ -621,9 +741,13 @@ async function proxyStreamWithTools(
   }
 
   const emitToolStart = (name: string, tid: string) => {
+    if (toolCallEmitted) return
+    toolCallEmitted = true
+    currentTid = tid
     controller.enqueue(encoder.encode(sseChunk({
       id, choices: [{
         index: 0, delta: {
+          role: "assistant",
           tool_calls: [{ index: toolIndex, id: tid, type: "function", function: { name, arguments: "" } }]
         }, finish_reason: null
       }]
@@ -631,6 +755,7 @@ async function proxyStreamWithTools(
   }
 
   const emitToolDelta = (delta: string) => {
+    if (!toolCallEmitted) return
     controller.enqueue(encoder.encode(sseChunk({
       id, choices: [{
         index: 0, delta: {
@@ -638,6 +763,13 @@ async function proxyStreamWithTools(
         }, finish_reason: null
       }]
     })))
+  }
+
+  const emitFullToolCall = (tc: ParsedToolCall) => {
+    if (toolCallEmitted) return
+    const tid = `call_${Date.now()}_${toolIndex}`
+    emitToolStart(tc.tool, tid)
+    emitToolDelta(JSON.stringify(tc.parameters))
   }
 
   const checkTags = () => {
@@ -684,6 +816,7 @@ async function proxyStreamWithTools(
           const parsed = JSON.parse(data)
           const text = extractTextFromEvent(type, parsed)
           if (text) {
+            accumulatedText += text
             if (hasTools) {
               tagBuffer += text
               checkTags()
@@ -705,6 +838,14 @@ async function proxyStreamWithTools(
     if (tagBuffer) {
       if (inToolCall) emitToolDelta(tagBuffer)
       else flushText(tagBuffer)
+    }
+
+    if (hasTools && !toolCallEmitted && accumulatedText.length > 10) {
+      const tc = extractToolCall(accumulatedText)
+      if (tc) {
+        log.info(`[WebChat] ${type} found tool call via extractToolCall: ${tc.tool}`)
+        emitFullToolCall(tc)
+      }
     }
   } finally {
     reader.releaseLock()
@@ -729,22 +870,16 @@ async function proxyNonStream(
   const fullText = texts.join("")
 
   const choices: any[] = []
-  if (tools?.length && fullText.includes("<tool_call")) {
-    const tcRegex = /<tool_call\s+(?:id=['"]?([^'"]*)['"]?\s+)?name=['"]?([^'"]+)['"]?\s*([\s\S]*?)<\/tool_call>/gi
-    let match: RegExpExecArray | null
-    let idx = 0
-    while ((match = tcRegex.exec(fullText)) !== null) {
-      const argsRaw = match[3]?.trim() ?? "{}"
-      let args = argsRaw
-      if (args.startsWith("```json")) args = args.slice(7).trim()
-      if (args.endsWith("```")) args = args.slice(0, -3).trim()
+  if (tools?.length && !EXCLUDED_FROM_TOOLS.has(type)) {
+    const tc = extractToolCall(fullText)
+    if (tc) {
+      log.info(`[WebChat] ${type} non-stream tool call found: ${tc.tool}`)
       choices.push({
-        index: idx++,
-        message: { role: "assistant", content: null, tool_calls: [{ id: match[1] || `call_${idx}`, type: "function", function: { name: match[2], arguments: args } }] },
+        index: 0,
+        message: { role: "assistant", content: null, tool_calls: [{ id: `call_${Date.now()}`, type: "function", function: { name: tc.tool, arguments: JSON.stringify(tc.parameters) } }] },
         finish_reason: "tool_calls",
       })
-    }
-    if (choices.length === 0) {
+    } else {
       choices.push({ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" })
     }
   } else {
