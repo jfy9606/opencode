@@ -23,7 +23,7 @@ import { McpRoutes } from "./mcp"
 import { FileRoutes } from "./file"
 import { ConfigRoutes } from "./config"
 import { ExperimentalRoutes } from "./experimental"
-import { ProviderRoutes } from "./provider"
+import { WebProviderRoutes } from "./web-provider"
 import { EventRoutes } from "./event"
 import { SyncRoutes } from "./sync"
 import { InstanceMiddleware } from "./middleware"
@@ -57,7 +57,7 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono => {
     .route("/session", SessionRoutes())
     .route("/permission", PermissionRoutes())
     .route("/question", QuestionRoutes())
-    .route("/provider", ProviderRoutes())
+    .route("/provider", WebProviderRoutes())
     .route("/sync", SyncRoutes())
     .route("/", FileRoutes())
     .route("/", EventRoutes())

@@ -3,6 +3,7 @@ import { Config } from "@/config"
 import { ModelsDev } from "@/provider"
 import { Provider } from "@/provider"
 import { ProviderID } from "@/provider/schema"
+import { WEB_PROVIDERS, ZERO_COST } from "@/provider/web"
 import { mapValues } from "remeda"
 import { Effect, Layer, Schema } from "effect"
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
@@ -91,6 +92,18 @@ export const providerHandlers = Layer.unwrap(
         mapValues(filtered, (item) => Provider.fromModelsDevProvider(item)),
         connected,
       )
+
+      for (const [id, wp] of Object.entries(WEB_PROVIDERS)) {
+        if (id in providers) continue
+        if (disabled.has(id)) continue
+        providers[id] = {
+          id,
+          name: wp.name,
+          models: [{ id: `${id}/default`, name: wp.name, input: ["text"], cost: ZERO_COST, contextWindow: 128000, maxTokens: 8192 }],
+          default: `${id}/default`,
+        }
+      }
+
       return {
         all: Object.values(providers),
         default: Provider.defaultModelIDs(providers),

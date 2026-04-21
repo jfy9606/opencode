@@ -2,13 +2,9 @@ import { Hono } from "hono"
 import { describeRoute, validator, resolver } from "hono-openapi"
 import z from "zod"
 import { streamSSE } from "hono/streaming"
-import { Config } from "../../config/config"
-import { Provider } from "../../provider/provider"
-import { ModelsDev } from "../../provider/models"
-import { ProviderAuth } from "../../provider/auth"
 import { Auth } from "../../auth"
 import { ProviderID } from "../../provider/schema"
-import { WEB_PROVIDERS, ZERO_COST, loginWebProvider } from "../../provider/web/index"
+import { WEB_PROVIDERS, loginWebProvider } from "../../provider/web/index"
 import type { WebProviderType, WebAuthCredentials } from "../../provider/web/types"
 import { DeepSeekWebClient } from "../../provider/web/clients/deepseek-web-client"
 import { ClaudeWebClient } from "../../provider/web/clients/claude-web-client"
@@ -23,238 +19,14 @@ import { PerplexityWebClient } from "../../provider/web/clients/perplexity-web-c
 import { XiaomiMimoWebClient } from "../../provider/web/clients/xiaomimo-web-client"
 import { GeminiWebClient } from "../../provider/web/clients/gemini-web-client"
 import { GrokWebClient } from "../../provider/web/clients/grok-web-client"
-import { AppRuntime } from "../../effect/app-runtime"
-import { mapValues } from "remeda"
 import { errors } from "../error"
 import { lazy } from "../../util/lazy"
 import { Log } from "../../util/log"
-import { Effect } from "effect"
 
 const log = Log.create({ service: "server" })
 
-export const ProviderRoutes = lazy(() =>
+export const WebProviderRoutes = lazy(() =>
   new Hono()
-    .get(
-      "/",
-      describeRoute({
-        summary: "List providers",
-        description: "Get a list of all available AI providers, including both available and connected ones.",
-        operationId: "provider.list",
-        responses: {
-          200: {
-            description: "List of providers",
-            content: {
-              "application/json": {
-                schema: resolver(
-                  z.object({
-                    all: Provider.Info.array(),
-                    default: z.record(z.string(), z.string()),
-                    connected: z.array(z.string()),
-                  }),
-                ),
-              },
-            },
-          },
-        },
-      }),
-      async (c) => {
-        const result = await AppRuntime.runPromise(
-          Effect.gen(function* () {
-            const svc = yield* Provider.Service
-            const cfg = yield* Config.Service
-            const config = yield* cfg.get()
-            const all = yield* Effect.promise(() => ModelsDev.get())
-            const disabled = new Set(config.disabled_providers ?? [])
-            const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
-            const filtered: Record<string, (typeof all)[string]> = {}
-            for (const [key, value] of Object.entries(all)) {
-              if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) {
-                filtered[key] = value
-              }
-            }
-            const connected = yield* svc.list()
-            const providers = Object.assign(
-              mapValues(filtered, (x) => Provider.fromModelsDevProvider(x)),
-              connected,
-            )
-            return {
-              all: Object.values(providers),
-              default: mapValues(providers, (item) => Provider.sort(Object.values(item.models))[0].id),
-              connected: Object.keys(connected),
-            }
-          }),
-        )
-
-        for (const [id, wp] of Object.entries(WEB_PROVIDERS)) {
-          if (id in providers) continue
-          if (disabled.has(id)) continue
-          providers[id] = {
-            id,
-            name: wp.name,
-            source: "custom" as const,
-            env: [],
-            options: {},
-            models: Object.fromEntries(
-              wp.models.map((m) => [
-                m.id,
-                {
-                  id: m.id,
-                  name: m.name,
-                  api: { id: m.id, url: `/provider/${id}`, npm: "@ai-sdk/openai-compatible" },
-                  cost: ZERO_COST,
-                  limit: { context: m.contextWindow, output: m.maxTokens },
-                  status: "active",
-                  options: {},
-                  headers: {},
-                  release_date: "",
-                  variants: {},
-                  capabilities: {
-                    temperature: !m.reasoning,
-                    reasoning: m.reasoning,
-                    attachment: m.input.includes("image"),
-                    toolcall: true,
-                    input: {
-                      text: m.input.includes("text"),
-                      image: m.input.includes("image"),
-                      video: false,
-                      pdf: false,
-                    },
-                    output: { text: true, audio: false, image: false, video: false, pdf: false },
-                    interleaved: false,
-                  },
-                },
-              ]),
-            ),
-          } as unknown as (typeof providers)[string]
-        }
-
-        const connectedKeys = Object.keys(connected)
-        const allAuth = await Auth.all()
-        for (const id of Object.keys(WEB_PROVIDERS)) {
-          if (connectedKeys.includes(id)) continue
-          if (allAuth[id]) connectedKeys.push(id)
-        }
-
-        return c.json({
-          all: result.all,
-          default: result.default,
-          connected: result.connected,
-        })
-      },
-    )
-    .get(
-      "/auth",
-      describeRoute({
-        summary: "Get provider auth methods",
-        description: "Retrieve available authentication methods for all AI providers.",
-        operationId: "provider.auth",
-        responses: {
-          200: {
-            description: "Provider auth methods",
-            content: {
-              "application/json": {
-                schema: resolver(z.record(z.string(), z.array(ProviderAuth.Method))),
-              },
-            },
-          },
-        },
-      }),
-      async (c) => {
-        return c.json(await AppRuntime.runPromise(ProviderAuth.Service.use((svc) => svc.methods())))
-      },
-    )
-    .post(
-      "/:providerID/oauth/authorize",
-      describeRoute({
-        summary: "OAuth authorize",
-        description: "Initiate OAuth authorization for a specific AI provider to get an authorization URL.",
-        operationId: "provider.oauth.authorize",
-        responses: {
-          200: {
-            description: "Authorization URL and method",
-            content: {
-              "application/json": {
-                schema: resolver(ProviderAuth.Authorization.optional()),
-              },
-            },
-          },
-          ...errors(400),
-        },
-      }),
-      validator(
-        "param",
-        z.object({
-          providerID: ProviderID.zod.meta({ description: "Provider ID" }),
-        }),
-      ),
-      validator(
-        "json",
-        z.object({
-          method: z.number().meta({ description: "Auth method index" }),
-          inputs: z.record(z.string(), z.string()).optional().meta({ description: "Prompt inputs" }),
-        }),
-      ),
-      async (c) => {
-        const providerID = c.req.valid("param").providerID
-        const { method, inputs } = c.req.valid("json")
-        const result = await AppRuntime.runPromise(
-          ProviderAuth.Service.use((svc) =>
-            svc.authorize({
-              providerID,
-              method,
-              inputs,
-            }),
-          ),
-        )
-        return c.json(result)
-      },
-    )
-    .post(
-      "/:providerID/oauth/callback",
-      describeRoute({
-        summary: "OAuth callback",
-        description: "Handle the OAuth callback from a provider after user authorization.",
-        operationId: "provider.oauth.callback",
-        responses: {
-          200: {
-            description: "OAuth callback processed successfully",
-            content: {
-              "application/json": {
-                schema: resolver(z.boolean()),
-              },
-            },
-          },
-          ...errors(400),
-        },
-      }),
-      validator(
-        "param",
-        z.object({
-          providerID: ProviderID.zod.meta({ description: "Provider ID" }),
-        }),
-      ),
-      validator(
-        "json",
-        z.object({
-          method: z.number().meta({ description: "Auth method index" }),
-          code: z.string().optional().meta({ description: "OAuth authorization code" }),
-        }),
-      ),
-      async (c) => {
-        const providerID = c.req.valid("param").providerID
-        const { method, code } = c.req.valid("json")
-        await AppRuntime.runPromise(
-          ProviderAuth.Service.use((svc) =>
-            svc.callback({
-              providerID,
-              method,
-              code,
-            }),
-          ),
-        )
-        return c.json(true)
-      },
-    )
     .post(
       "/:providerID/web-auth",
       describeRoute({
@@ -846,10 +618,9 @@ async function proxyStreamWithTools(
         log.info(`[WebChat] ${type} found tool call via extractToolCall: ${tc.tool}`)
         emitFullToolCall(tc)
       }
+    } finally {
+      reader.releaseLock()
     }
-  } finally {
-    reader.releaseLock()
-  }
 }
 
 async function proxyNonStream(
