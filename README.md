@@ -120,6 +120,55 @@ For more info on how to configure OpenCode, [**head over to our docs**](https://
 
 If you're interested in contributing to OpenCode, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
 
+### Building from Source
+
+> Full build guide available in [BUILD.md](./BUILD.md).
+
+#### Prerequisites
+
+| Tool | Version | Purpose |
+|------|---------|---------|
+| [Bun](https://bun.sh) | >= 1.x | CLI build, frontend, package manager |
+| Rust (rustup) | stable + GNU target | Tauri Desktop cross-compile |
+| makensis (nsis) | latest | Windows NSIS installer |
+
+#### Quick Build (Linux → Windows)
+
+```bash
+# 1. Build CLI for all platforms
+cd packages/opencode && bun run script/build.ts --skip-install
+
+# 2. Deploy CLI sidecar & build Tauri Desktop
+cp dist/opencode-windows-x64-baseline/bin/opencode.exe \
+   ../desktop/src-tauri/sidecars/opencode-cli-x86_64-pc-windows-gnu.exe
+cd ../desktop && bun run tauri build --target x86_64-pc-windows-gnu --config src-tauri/tauri.conf.json
+
+# 3. Package NSIS installer
+makensis installer.nsi
+```
+
+Output: `packages/desktop/OpenCode_Setup.exe` (~83 MB)
+
+#### Platform-Specific Builds
+
+```bash
+# macOS
+cd packages/opencode && bun run script/build.ts --skip-install
+cd packages/desktop && bun run tauri build --config src-tauri/tauri.prod.conf.json
+
+# Linux (native)
+sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+cd packages/opencode && bun run script/build.ts --skip-install
+cd packages/desktop && bun run tauri build
+
+# Windows (MSVC)
+cd packages\opencode; bun run script\build.ts --skip-install
+cd packages\desktop; bun run tauri build --config src-tauri\tauri.prod.conf.json
+```
+
+> ⚠️ **Important**: Always use `bun run tauri build` instead of `cargo build` for Desktop.
+> `cargo build` skips Vite frontend build and embedding, causing a blank screen at runtime.
+
 ### Building on OpenCode
 
 If you are working on a project that's related to OpenCode and is using "opencode" as part of its name, for example "opencode-dashboard" or "opencode-mobile", please add a note to your README to clarify that it is not built by the OpenCode team and is not affiliated with us in any way.
