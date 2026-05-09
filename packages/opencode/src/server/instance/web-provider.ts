@@ -618,9 +618,10 @@ async function proxyStreamWithTools(
         log.info(`[WebChat] ${type} found tool call via extractToolCall: ${tc.tool}`)
         emitFullToolCall(tc)
       }
-    } finally {
-      reader.releaseLock()
     }
+  } finally {
+    reader.releaseLock()
+  }
 }
 
 async function proxyNonStream(
