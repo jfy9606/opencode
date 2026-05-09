@@ -31,3 +31,7 @@ logs/
 *.bun-build
 tsconfig.tsbuildinfo
 example/
+
+# Desktop sidecars (compiled binaries - too large for GitHub)
+packages/desktop/src-tauri/sidecars/
+packages/desktop/src-tauri/gen/
