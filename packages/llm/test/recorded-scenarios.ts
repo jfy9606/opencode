@@ -1,12 +1,24 @@
 import { expect } from "bun:test"
 import { Effect, Schema, Stream } from "effect"
-import { LLM, LLMEvent, LLMResponse, type LLMRequest, type ModelRef } from "../src"
+import { LLM, LLMEvent, LLMResponse, Message, ToolChoice, ToolDefinition, type LLMRequest, type Model } from "../src"
 import { LLMClient } from "../src/route"
 import { tool } from "../src/tool"
 
 export const weatherToolName = "get_weather"
 
-export const weatherTool = LLM.toolDefinition({
+// A deterministic system prompt long enough to clear every supported provider's
+// minimum cacheable-prefix threshold (Anthropic Haiku 3.5: 2048 tokens; Anthropic
+// Opus/Haiku 4.5: 4096 tokens; OpenAI/Gemini/Bedrock: lower). Built by repeating
+// a fixed sentence — the cassette replays bit-for-bit, so the exact text matters
+// only when re-recording with `RECORD=true`.
+export const LARGE_CACHEABLE_SYSTEM = (() => {
+  const sentence = "You are a concise, factual assistant. Answer precisely and avoid filler. Cite numbers when known. "
+  // ~100 chars per sentence × 250 repeats ≈ 25,000 chars ≈ 5k+ tokens, safely
+  // above every provider's threshold.
+  return sentence.repeat(250)
+})()
+
+export const weatherTool = ToolDefinition.make({
   name: weatherToolName,
   description: "Get current weather for a city.",
   inputSchema: {
@@ -29,7 +41,7 @@ export const weatherRuntimeTool = tool({
 
 export const textRequest = (input: {
   readonly id: string
-  readonly model: ModelRef
+  readonly model: Model
   readonly prompt?: string
   readonly maxTokens?: number
   readonly temperature?: number | false
@@ -39,15 +51,18 @@ export const textRequest = (input: {
     model: input.model,
     system: "You are concise.",
     prompt: input.prompt ?? "Reply with exactly: Hello!",
+    cache: "none",
+    providerOptions:
+      input.model.route.id === "gemini" ? { gemini: { thinkingConfig: { thinkingBudget: 0 } } } : undefined,
     generation:
       input.temperature === false
-        ? { maxTokens: input.maxTokens ?? 20 }
-        : { maxTokens: input.maxTokens ?? 20, temperature: input.temperature ?? 0 },
+        ? { maxTokens: input.maxTokens ?? 80 }
+        : { maxTokens: input.maxTokens ?? 80, temperature: input.temperature ?? 0 },
   })
 
 export const weatherToolRequest = (input: {
   readonly id: string
-  readonly model: ModelRef
+  readonly model: Model
   readonly maxTokens?: number
   readonly temperature?: number | false
 }) =>
@@ -57,7 +72,8 @@ export const weatherToolRequest = (input: {
     system: "Call tools exactly as requested.",
     prompt: "Call get_weather with city exactly Paris.",
     tools: [weatherTool],
-    toolChoice: LLM.toolChoice(weatherTool),
+    toolChoice: ToolChoice.make(weatherTool),
+    cache: "none",
     generation:
       input.temperature === false
         ? { maxTokens: input.maxTokens ?? 80 }
@@ -66,7 +82,7 @@ export const weatherToolRequest = (input: {
 
 export const weatherToolLoopRequest = (input: {
   readonly id: string
-  readonly model: ModelRef
+  readonly model: Model
   readonly system?: string
   readonly maxTokens?: number
   readonly temperature?: number | false
@@ -76,6 +92,7 @@ export const weatherToolLoopRequest = (input: {
     model: input.model,
     system: input.system ?? "Use the get_weather tool, then answer in one short sentence.",
     prompt: "What is the weather in Paris?",
+    cache: "none",
     generation:
       input.temperature === false
         ? { maxTokens: input.maxTokens ?? 80 }
@@ -84,13 +101,65 @@ export const weatherToolLoopRequest = (input: {
 
 export const goldenWeatherToolLoopRequest = (input: {
   readonly id: string
-  readonly model: ModelRef
+  readonly model: Model
   readonly maxTokens?: number
   readonly temperature?: number | false
 }) =>
   weatherToolLoopRequest({
     ...input,
     system: "Use the get_weather tool exactly once. After the tool result, reply exactly: Paris is sunny.",
+  })
+
+const RESTROOM_IMAGE_TEXT = "jiggling restroom prison"
+const restroomImage = () =>
+  Effect.promise(() => Bun.file(new URL("./fixtures/media/restroom.png", import.meta.url)).bytes()).pipe(
+    Effect.map((bytes) => Buffer.from(bytes).toString("base64")),
+  )
+
+export const imageRequest = (input: {
+  readonly id: string
+  readonly model: Model
+  readonly image: string
+  readonly maxTokens?: number
+  readonly temperature?: number | false
+}) =>
+  LLM.request({
+    id: input.id,
+    model: input.model,
+    system: "Read images carefully. Reply only with the visible text.",
+    messages: [
+      Message.user([
+        {
+          type: "text",
+          text: "The image contains exactly three lowercase English words. Read them left to right and reply with only those words.",
+        },
+        { type: "media", mediaType: "image/png", data: input.image },
+      ]),
+    ],
+    cache: "none",
+    generation:
+      input.temperature === false
+        ? { maxTokens: input.maxTokens ?? 20 }
+        : { maxTokens: input.maxTokens ?? 20, temperature: input.temperature ?? 0 },
+  })
+
+export const reasoningRequest = (input: {
+  readonly id: string
+  readonly model: Model
+  readonly maxTokens?: number
+  readonly temperature?: number | false
+}) =>
+  LLM.request({
+    id: input.id,
+    model: input.model,
+    system: "Show concise reasoning when the provider supports visible reasoning summaries.",
+    prompt: "Think briefly, then reply exactly with: Hello!",
+    cache: "none",
+    providerOptions: { openai: { reasoningEffort: "low", reasoningSummary: "auto" } },
+    generation:
+      input.temperature === false
+        ? { maxTokens: input.maxTokens ?? 120 }
+        : { maxTokens: input.maxTokens ?? 120, temperature: input.temperature ?? 0 },
   })
 
 export const runWeatherToolLoop = (request: LLMRequest) =>
@@ -105,8 +174,8 @@ export const runWeatherToolLoop = (request: LLMRequest) =>
 
 export const expectFinish = (
   events: ReadonlyArray<LLMEvent>,
-  reason: Extract<LLMEvent, { readonly type: "request-finish" }>["reason"],
-) => expect(events.at(-1)).toMatchObject({ type: "request-finish", reason })
+  reason: Extract<LLMEvent, { readonly type: "finish" }>["reason"],
+) => expect(events.at(-1)).toMatchObject({ type: "finish", reason })
 
 export const expectWeatherToolCall = (response: LLMResponse) =>
   expect(response.toolCalls).toMatchObject([
@@ -114,10 +183,12 @@ export const expectWeatherToolCall = (response: LLMResponse) =>
   ])
 
 export const expectWeatherToolLoop = (events: ReadonlyArray<LLMEvent>) => {
-  const finishes = events.filter(LLMEvent.is.requestFinish)
-  expect(finishes).toHaveLength(2)
-  expect(finishes[0]?.reason).toBe("tool-calls")
-  expect(finishes.at(-1)?.reason).toBe("stop")
+  const finishes = events.filter(LLMEvent.is.finish)
+  expect(finishes).toHaveLength(1)
+  expect(finishes[0]?.reason).toBe("stop")
+
+  const stepFinishes = events.filter(LLMEvent.is.stepFinish)
+  expect(stepFinishes.map((event) => event.reason)).toEqual(["tool-calls", "stop"])
 
   const toolCalls = events.filter(LLMEvent.is.toolCall)
   expect(toolCalls).toHaveLength(1)
@@ -141,20 +212,29 @@ export const expectGoldenWeatherToolLoop = (events: ReadonlyArray<LLMEvent>) => 
   expect(LLMResponse.text({ events }).trim()).toMatch(/^Paris is sunny\.?$/)
 }
 
-export type GoldenScenarioID = "text" | "tool-call" | "tool-loop"
+export type GoldenScenarioID = "text" | "tool-call" | "tool-loop" | "image" | "reasoning"
 
 export interface GoldenScenarioContext {
   readonly id: string
-  readonly model: ModelRef
+  readonly model: Model
   readonly maxTokens?: number
   readonly temperature?: number | false
 }
 
 const generate = (request: LLMRequest) => LLMClient.generate(request)
 
+const normalizeImageText = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+
 export const goldenScenarioTags = (id: GoldenScenarioID) => {
   if (id === "text") return ["text", "golden"]
   if (id === "tool-call") return ["tool", "tool-call", "golden"]
+  if (id === "image") return ["media", "image", "vision", "golden"]
+  if (id === "reasoning") return ["reasoning", "golden"]
   return ["tool", "tool-loop", "golden"]
 }
 
@@ -189,6 +269,36 @@ export const runGoldenScenario = (id: GoldenScenarioID, context: GoldenScenarioC
       return
     }
 
+    if (id === "image") {
+      const response = yield* generate(
+        imageRequest({
+          id: context.id,
+          model: context.model,
+          image: yield* restroomImage(),
+          maxTokens: context.maxTokens ?? 20,
+          temperature: context.temperature,
+        }),
+      )
+      expect(normalizeImageText(response.text)).toBe(RESTROOM_IMAGE_TEXT)
+      expectFinish(response.events, "stop")
+      return
+    }
+
+    if (id === "reasoning") {
+      const response = yield* generate(
+        reasoningRequest({
+          id: context.id,
+          model: context.model,
+          maxTokens: context.maxTokens ?? 120,
+          temperature: context.temperature,
+        }),
+      )
+      expect(response.text.trim()).toMatch(/^Hello!?$/)
+      expect(response.usage?.reasoningTokens ?? 0).toBeGreaterThan(0)
+      expectFinish(response.events, "stop")
+      return
+    }
+
     expectGoldenWeatherToolLoop(
       yield* runWeatherToolLoop(
         goldenWeatherToolLoopRequest({
@@ -218,7 +328,7 @@ const usageSummary = (usage: LLMResponse["usage"] | undefined) => {
 const pushText = (summary: Array<Record<string, unknown>>, type: "text" | "reasoning", value: string) => {
   const last = summary.at(-1)
   if (last?.type === type) {
-    last.value = `${last.value ?? ""}${value}`
+    last.value = `${typeof last.value === "string" ? last.value : ""}${value}`
     return
   }
   summary.push({ type, value })
@@ -257,7 +367,7 @@ export const eventSummary = (events: ReadonlyArray<LLMEvent>) => {
       summary.push({ type: "tool-error", name: event.name, message: event.message })
       continue
     }
-    if (event.type === "request-finish") {
+    if (event.type === "finish") {
       summary.push({ type: "finish", reason: event.reason, usage: usageSummary(event.usage) })
     }
   }
