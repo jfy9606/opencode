@@ -393,3 +393,4 @@ export type { WebAuthCredentials, WebLoginOptions, WebProviderType } from "./typ
 
 export * from "./clients/index.js"
 export * from "./streams/index.js"
+export * from "./routes.js"

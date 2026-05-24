@@ -10,7 +10,7 @@ import { Plugin } from "../plugin"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { type LanguageModelV3 } from "@ai-sdk/provider"
 import * as ModelsDev from "@opencode-ai/core/models-dev"
-import { WEB_PROVIDERS, ZERO_COST } from "./web"
+import { WEB_PROVIDERS, ZERO_COST, WebProviderRoutes } from "./web"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -849,6 +849,22 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
           },
         },
       }),
+    ...Object.fromEntries(
+      Object.keys(WEB_PROVIDERS).map((id) => [
+        id,
+        Effect.fnUntraced(function* () {
+          const authInfo = yield* dep.auth(id)
+          if (!authInfo || authInfo.type !== "api" || !authInfo.key) return { autoload: false }
+          return {
+            autoload: true,
+            options: {
+              baseURL: `http://localhost/provider/${id}`,
+              apiKey: "web-auth",
+            },
+          }
+        }),
+      ]),
+    ),
   }
 }
 
@@ -1122,7 +1138,67 @@ function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model
   }
 }
 
-export function fromModelsDevProvider(provider: ModelsDev.Provider): Info {
+export function fromWebProvider(id: string, provider: any): Info {
+  const models: Record<string, Model> = {}
+  for (const m of provider.models) {
+    models[m.id] = {
+      id: ModelID.make(m.id),
+      providerID: ProviderID.make(id),
+      name: m.name,
+      family: "",
+      api: {
+        id: m.id,
+        url: "",
+        npm: "@ai-sdk/openai-compatible",
+      },
+      status: "active",
+      headers: {},
+      options: {},
+      cost: {
+        input: 0,
+        output: 0,
+        cache: { read: 0, write: 0 },
+      },
+      limit: {
+        context: m.contextWindow,
+        output: m.maxTokens,
+      },
+      capabilities: {
+        temperature: false,
+        reasoning: m.reasoning,
+        attachment: m.input.includes("image") || m.input.includes("pdf"),
+        toolcall: true,
+        input: {
+          text: m.input.includes("text"),
+          audio: m.input.includes("audio"),
+          image: m.input.includes("image"),
+          video: m.input.includes("video"),
+          pdf: m.input.includes("pdf"),
+        },
+        output: {
+          text: true,
+          audio: false,
+          image: false,
+          video: false,
+          pdf: false,
+        },
+        interleaved: false,
+      },
+      release_date: "",
+      variants: {},
+    }
+  }
+  return {
+    id: ProviderID.make(id),
+    source: "custom",
+    name: provider.name,
+    env: [],
+    options: {},
+    models,
+  }
+}
+
+function fromModelsDevProvider(provider: ModelsDev.Provider): Info {
   const models: Record<string, Model> = {}
   for (const [key, model] of Object.entries(provider.models)) {
     models[key] = fromModelsDevModel(provider, model)
@@ -1206,6 +1282,12 @@ export const layer = Layer.effect(
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
         const catalog = mapValues(modelsDev, fromModelsDevProvider)
+
+        for (const [id, provider] of Object.entries(WEB_PROVIDERS)) {
+          const providerID = ProviderID.make(id)
+          catalog[providerID] = fromWebProvider(id, provider)
+        }
+
         const database = mapValues(catalog, toPublicInfo)
 
         const providers: Record<ProviderID, Info> = {} as Record<ProviderID, Info>
@@ -1605,6 +1687,11 @@ export const layer = Layer.effect(
         delete options["chunkTimeout"]
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
+          if (model.providerID.endsWith("-web")) {
+            const hono = WebProviderRoutes()
+            const request = new Request(input, init)
+            return hono.fetch(request)
+          }
           const fetchFn = customFetch ?? fetch
           const opts = init ?? {}
           const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
