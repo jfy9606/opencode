@@ -1,14 +1,14 @@
-import { DateTime, Effect, Scope, Stream } from "effect"
-import { Catalog } from "../catalog"
+import { define } from "./internal"
+import { Effect, Stream } from "effect"
 import { EventV2 } from "../event"
 import { ModelV2 } from "../model"
+import { ModelRequest } from "../model-request"
 import { ModelsDev } from "../models-dev"
-import { PluginV2 } from "../plugin"
 import { ProviderV2 } from "../provider"
 
 function released(date: string) {
   const time = Date.parse(date)
-  return DateTime.makeUnsafe(Number.isFinite(time) ? time : 0)
+  return Number.isFinite(time) ? time : 0
 }
 
 function cost(input: ModelsDev.Model["cost"]) {
@@ -38,30 +38,47 @@ function cost(input: ModelsDev.Model["cost"]) {
   ]
 }
 
-function variants(model: ModelsDev.Model) {
-  return Object.entries(model.experimental?.modes ?? {}).map(([id, item]) => ({
-    id: ModelV2.VariantID.make(id),
-    headers: { ...(item.provider?.headers ?? {}) },
-    body: { ...(item.provider?.body ?? {}) },
-  }))
+function variants(model: ModelsDev.Model, packageName?: string) {
+  return Object.entries(model.experimental?.modes ?? {}).map(([id, item]) => {
+    const request = ModelRequest.normalizeAiSdkOptions(packageName, item.provider?.body ?? {})
+    return {
+      id: ModelV2.VariantID.make(id),
+      headers: { ...(item.provider?.headers ?? {}) },
+      ...request,
+    }
+  })
 }
 
-export const ModelsDevPlugin = PluginV2.define({
-  id: PluginV2.ID.make("models-dev"),
-  effect: Effect.gen(function* () {
-    const catalog = yield* Catalog.Service
+export const ModelsDevPlugin = define({
+  id: "models-dev",
+  effect: Effect.fn(function* (ctx) {
     const modelsDev = yield* ModelsDev.Service
     const events = yield* EventV2.Service
-    const scope = yield* Scope.Scope
-    const transform = yield* catalog.transform()
-    const refresh = Effect.fn("ModelsDevPlugin.refresh")(function* () {
-      const data = yield* modelsDev.get()
-      yield* transform((catalog) => {
+    yield* ctx.integration.transform(
+      Effect.fn(function* (integrations) {
+        const data = yield* modelsDev.get()
+        for (const item of Object.values(data)) {
+          if (item.env.length === 0) continue
+          const integrationID = item.id
+          integrations.update(integrationID, (integration) => (integration.name = item.name))
+          integrations.method.update({
+            integrationID,
+            method: { type: "key" },
+          })
+          integrations.method.update({
+            integrationID,
+            method: { type: "env", names: [...item.env] },
+          })
+        }
+      }),
+    )
+    yield* ctx.catalog.transform(
+      Effect.fn(function* (catalog) {
+        const data = yield* modelsDev.get()
         for (const item of Object.values(data)) {
           const providerID = ProviderV2.ID.make(item.id)
           catalog.provider.update(providerID, (provider) => {
             provider.name = item.name
-            provider.env = [...item.env]
             provider.api = item.npm
               ? {
                   type: "aisdk",
@@ -98,7 +115,7 @@ export const ModelsDevPlugin = PluginV2.define({
                 input: [...(model.modalities?.input ?? [])],
                 output: [...(model.modalities?.output ?? [])],
               }
-              draft.variants = variants(model)
+              draft.variants = variants(model, model.provider?.npm ?? item.npm)
               draft.time.released = released(model.release_date)
               draft.cost = cost(model.cost)
               draft.status = model.status ?? "active"
@@ -111,11 +128,10 @@ export const ModelsDevPlugin = PluginV2.define({
             })
           }
         }
-      })
-    })
-    yield* refresh()
+      }),
+    )
     yield* events.subscribe(ModelsDev.Event.Refreshed).pipe(
-      Stream.runForEach(() => refresh()),
+      Stream.runForEach(() => ctx.integration.reload().pipe(Effect.andThen(ctx.catalog.reload()))),
       Effect.forkScoped({ startImmediately: true }),
     )
   }),

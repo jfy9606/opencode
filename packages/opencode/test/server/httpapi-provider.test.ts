@@ -2,14 +2,11 @@ import { describe, expect } from "bun:test"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Layer } from "effect"
 import path from "path"
-import * as Log from "@opencode-ai/core/util/log"
 import { resetDatabase } from "../fixture/db"
 import { TestInstance } from "../fixture/fixture"
 import { markPluginDependenciesReady } from "../fixture/plugin"
 import { testEffect } from "../lib/effect"
 import { httpApiLayer, request } from "./httpapi-layer"
-
-void Log.init({ print: false })
 
 const testStateLayer = Layer.effectDiscard(
   Effect.acquireRelease(
@@ -378,6 +375,26 @@ describe("provider HttpApi", () => {
       expect(hasNonZeroModelCost(configBody, "providers", "google")).toBe(true)
     }),
     { ...projectOptions, init: writeFunctionOptionsPlugin },
+  )
+
+  it.instance(
+    "lists built-in web providers before they are connected",
+    Effect.gen(function* () {
+      const directory = (yield* TestInstance).directory
+      const response = yield* request("/provider", {
+        headers: { "x-opencode-directory": directory },
+      })
+
+      expect(response.status).toBe(200)
+
+      const body = yield* response.json
+      const chatgpt = providerByID(body, "all", "chatgpt-web")
+      expect(isRecord(chatgpt)).toBe(true)
+      expect(chatgpt?.name).toBe("ChatGPT (Web)")
+      expect(isRecord(chatgpt?.models)).toBe(true)
+      expect(chatgpt && isRecord(chatgpt.models) && "gpt-4" in chatgpt.models).toBe(true)
+    }),
+    projectOptions,
   )
 
   it.instance(

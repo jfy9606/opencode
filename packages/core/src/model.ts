@@ -1,6 +1,6 @@
-import { DateTime, Schema } from "effect"
-import { DateTimeUtcFromMillis } from "effect/Schema"
+import { Schema, Types } from "effect"
 import { ProviderV2 } from "./provider"
+import { ModelRequest } from "./model-request"
 
 export const ID = Schema.String.pipe(Schema.brand("ModelV2.ID"))
 export type ID = typeof ID.Type
@@ -15,8 +15,8 @@ export type Family = typeof Family.Type
 export const Capabilities = Schema.Struct({
   tools: Schema.Boolean,
   // mime patterns, image, audio, video/*, text/*
-  input: Schema.String.pipe(Schema.Array),
-  output: Schema.String.pipe(Schema.Array),
+  input: Schema.String.pipe(Schema.Array, Schema.mutable),
+  output: Schema.String.pipe(Schema.Array, Schema.mutable),
 })
 export type Capabilities = typeof Capabilities.Type
 
@@ -60,17 +60,17 @@ export class Info extends Schema.Class<Info>("ModelV2.Info")({
   api: Api,
   capabilities: Capabilities,
   request: Schema.Struct({
-    ...ProviderV2.Request.fields,
+    ...ModelRequest.Request.fields,
     variant: Schema.String.pipe(Schema.optional),
   }),
   variants: Schema.Struct({
     id: VariantID,
-    ...ProviderV2.Request.fields,
-  }).pipe(Schema.Array),
+    ...ModelRequest.Request.fields,
+  }).pipe(Schema.Array, Schema.mutable),
   time: Schema.Struct({
-    released: DateTimeUtcFromMillis,
+    released: Schema.Finite,
   }),
-  cost: Cost.pipe(Schema.Array),
+  cost: Cost.pipe(Schema.Array, Schema.mutable),
   status: Schema.Literals(["alpha", "beta", "deprecated", "active"]),
   enabled: Schema.Boolean,
   limit: Schema.Struct({
@@ -97,10 +97,12 @@ export class Info extends Schema.Class<Info>("ModelV2.Info")({
       request: {
         headers: {},
         body: {},
+        generation: {},
+        options: {},
       },
       variants: [],
       time: {
-        released: DateTime.makeUnsafe(0),
+        released: 0,
       },
       cost: [],
       status: "active",
@@ -111,6 +113,10 @@ export class Info extends Schema.Class<Info>("ModelV2.Info")({
       },
     })
   }
+}
+
+export type MutableInfo = Omit<Types.DeepMutable<Info>, "api"> & {
+  api: ProviderV2.MutableApi<Api>
 }
 
 export function parse(input: string): { providerID: ProviderV2.ID; modelID: ID } {

@@ -19,6 +19,15 @@ import { PerplexityWebClient } from "./clients/perplexity-web-client"
 import { XiaomiMimoWebClient } from "./clients/xiaomimo-web-client"
 import { GeminiWebClient } from "./clients/gemini-web-client"
 import { GrokWebClient } from "./clients/grok-web-client"
+import { getDeepSeekConversationState, setDeepSeekParentMessageID, setDeepSeekSessionID } from "./deepseek-session-state"
+import { type ParsedToolCall } from "./tool-calling/web-tool-parser"
+import { buildWebPrompt } from "./tool-calling/web-message-prompt"
+import { createFullToolCallChunks, createNonStreamChoice, createTextDeltaChunk, createToolCallArgumentsChunk, createToolCallStartChunk, resolveToolCallOutput } from "./tool-calling/web-tool-response"
+import { consumeWebToolStreamChunk, createWebToolStreamState, flushWebToolStreamState } from "./tool-calling/web-tool-stream"
+import { shouldInjectToolPrompt } from "./tool-calling/web-tool-prompt"
+import { parseGenericWebSSE } from "./streams/generic-web-stream"
+import { parseKimiConnectStream } from "./streams/kimi-web-stream"
+import { parseDeepSeekProviderSSE, parseDoubaoProviderSSE, parseXiaomiMimoProviderSSE, type ParsedProviderChunk } from "./streams/special-web-parsers"
 import { errors } from "../../server/error"
 import { lazy } from "../../util/lazy"
 import { Log } from "../../util/log"
@@ -168,237 +177,6 @@ export const WebProviderRoutes = lazy(() =>
     ),
   )
 
-function buildToolDefs(tools: any[]): string {
-  const defs: Array<{ name: string; description: string; parameters: Record<string, string> }> = []
-  for (const t of tools) {
-    const fn = t.function ?? t
-    const params: Record<string, string> = {}
-    if (fn.parameters?.properties) {
-      for (const [k, v] of Object.entries(fn.parameters.properties)) {
-        params[k] = (v as any).type ?? "string"
-      }
-    }
-    defs.push({ name: fn.name, description: fn.description ?? "", parameters: params })
-  }
-  return JSON.stringify(defs)
-}
-
-const TOOL_EXAMPLE = `Example: to add 1 to number 5, return:
-\`\`\`tool_json
-{"tool":"plus_one","parameters":{"number":"5"}}
-\`\`\`
-(plus_one is just an example, not a real tool)`
-
-function getToolPrompt(tools: any[], providerID: string): string {
-  const defs = buildToolDefs(tools)
-  const cnModels = new Set(["deepseek-web", "doubao-web", "qwen-cn-web", "kimi-web", "glm-web", "glm-intl-web", "xiaomimo-web"])
-  const strictModels = new Set(["chatgpt-web"])
-
-  if (cnModels.has(providerID)) {
-    return `工具: ${defs}
-
-示例: 要给数字5加1，返回:
-\`\`\`tool_json
-{"tool":"plus_one","parameters":{"number":"5"}}
-\`\`\`
-(plus_one仅为示例，非真实工具)
-
-你的真实工具见上方列表。需要时只回复tool_json块。不需要则直接回答。
-
-`
-  }
-
-  if (strictModels.has(providerID)) {
-    return `Tools: ${defs}
-
-${TOOL_EXAMPLE}
-
-Your actual tools are listed above. To use one, reply ONLY with the tool_json block. No extra text.
-No tool needed? Answer directly.
-
-`
-  }
-
-  return `Tools: ${defs}
-
-${TOOL_EXAMPLE}
-
-Your actual tools are listed above. To use one, reply ONLY with the tool_json block.
-No tool needed? Answer directly.
-
-`
-}
-
-const TOOL_KEYWORDS = [
-  "文件", "file", "read", "write", "创建", "写入", "读取", "打开", "保存",
-  "desktop", "目录", "directory", "folder", "文件夹",
-  "执行", "运行", "命令", "command", "run", "exec", "terminal", "终端", "shell",
-  "搜索", "search", "查找", "查询", "fetch", "抓取", "网页", "url", "http",
-  "下载", "download", "安装", "install", "更新", "update",
-  "帮我", "help me", "查看", "check", "look", "看看", "show",
-]
-
-function needsTools(message: string): boolean {
-  const lower = message.toLowerCase()
-  return TOOL_KEYWORDS.some((kw) => lower.includes(kw))
-}
-
-const EXCLUDED_FROM_TOOLS = new Set(["perplexity-web"])
-
-function buildWebPrompt(messages: any[], tools: any[], providerID: string): string {
-  const parts: string[] = []
-  let hasSystem = false
-
-  const hasTools = tools.length > 0 && !EXCLUDED_FROM_TOOLS.has(providerID)
-  const toolPrompt = hasTools ? getToolPrompt(tools, providerID) : ""
-
-  for (const msg of messages) {
-    if (msg.role === "system") {
-      hasSystem = true
-      let sys = typeof msg.content === "string" ? msg.content : ""
-      if (Array.isArray(msg.content)) {
-        sys = msg.content.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n")
-      }
-      parts.push(sys)
-      continue
-    }
-
-    if (msg.role === "assistant") {
-      const texts: string[] = []
-      const calls: string[] = []
-
-      if (typeof msg.content === "string" && msg.content) texts.push(msg.content)
-      else if (Array.isArray(msg.content)) {
-        for (const part of msg.content) {
-          if ((part as any).type === "text" && part.text) texts.push(part.text)
-          else if ((part as any).type === "tool-call") {
-            const tc = part as any
-            calls.push(`\`\`\`tool_json\n{"tool":"${tc.toolName}","parameters":${typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input ?? {})}}\n\`\`\``)
-          } else if ((part as any).type?.startsWith("tool-")) {
-            const tp = part as any
-            if (tp.state === "output-available" || tp.state === "output-error") {
-              const outText = tp.state === "output-error"
-                ? "[Error] " + (tp.errorText ?? "")
-                : (typeof tp.output === "string" ? tp.output : JSON.stringify(tp.output ?? ""))
-              parts.push(`Tool ${tp.tool ?? "unknown"} returned: ${outText}`)
-            }
-          }
-        }
-      }
-
-      if (msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          calls.push(`\`\`\`tool_json\n{"tool":"${tc.function.name}","parameters":${tc.function.arguments}}\n\`\`\``)
-        }
-      }
-      if (texts.length || calls.length) {
-        parts.push("Assistant:\n" + texts.join("") + (calls.length ? "\n" + calls.join("\n") : ""))
-      }
-      continue
-    }
-
-    if (msg.role === "tool" || msg.role === "toolResult") {
-      let resultText = ""
-      if (typeof msg.content === "string") resultText = msg.content
-      else if (Array.isArray(msg.content)) {
-        const tr = msg.content.find((p: any) => p.type === "tool-result")
-        resultText = tr?.text ?? JSON.stringify(msg.content)
-      } else resultText = JSON.stringify(msg.content)
-
-      const toolName = msg.name || ""
-      parts.push(`Tool ${toolName || "unknown"} returned: ${resultText}`)
-      continue
-    }
-
-    if (msg.role === "user") {
-      let text = ""
-      if (typeof msg.content === "string") text = msg.content
-      else if (Array.isArray(msg.content)) {
-        const segments: string[] = []
-        for (const part of msg.content) {
-          if ((part as any).type === "text" && part.text) segments.push(part.text)
-          else if ((part as any).type === "file") {
-            const fp = part as any
-            segments.push("[File: " + (fp.filename ?? "attachment") + " (" + (fp.mediaType ?? "unknown") + ")]")
-          }
-        }
-        text = segments.join("\n")
-      }
-      if (text) parts.push(text)
-    }
-  }
-
-  const joined = parts.join("\n\n")
-  if (!hasTools) return joined
-
-  const lastUserMsg = [...messages].reverse().find((m) => m.role === "user")
-  const userText = lastUserMsg
-    ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content :
-       Array.isArray(lastUserMsg.content) ? lastUserMsg.content.filter((p: any) => p.type === "text").map((p: any) => p.text).join("") : "")
-    : ""
-
-  if (userText && needsTools(userText)) {
-    return toolPrompt + "\n\n" + joined
-  }
-
-  return joined
-}
-
-
-function extractUserText(messages: any[]): string {
-  const parts: string[] = []
-  for (const msg of messages) {
-    if (msg.role === "system") continue
-    if (typeof msg.content === "string") parts.push(msg.content)
-    else if (Array.isArray(msg.content)) {
-      for (const part of msg.content) if (part.type === "text" && part.text) parts.push(part.text)
-    }
-  }
-  return parts.join("\n")
-}
-
-interface ParsedToolCall { tool: string; parameters: Record<string, unknown> }
-
-const FENCED_TOOL_REGEX = /```tool_json\s*\n?\s*(\{[\s\S]*?\})\}?\s*\n?\s*```/
-const BARE_TOOL_REGEX = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*(\{[\s\S]*?\})\s*\}/
-const XML_TOOL_REGEX = /<tool_call[^>]*>([\s\S]*?)<\/tool_call>/
-
-function extractToolCall(text: string): ParsedToolCall | null {
-  const fenced = FENCED_TOOL_REGEX.exec(text)
-  if (fenced) return parseToolJson(fenced[1])
-
-  const bare = BARE_TOOL_REGEX.exec(text)
-  if (bare) {
-    try { return { tool: bare[1], parameters: JSON.parse(bare[2]) } }
-    catch { return null }
-  }
-
-  const xml = XML_TOOL_REGEX.exec(text)
-  if (xml) return parseToolJson(xml[1])
-
-  const fuzzy = text.match(/\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*\{([^}]*)\}/)
-  if (fuzzy) {
-    const repaired = `{"tool":"${fuzzy[1]}","parameters":{${fuzzy[2]}}}`
-    const result = parseToolJson(repaired)
-    if (result) return result
-  }
-
-  return null
-}
-
-function parseToolJson(raw: string): ParsedToolCall | null {
-  try {
-    let cleaned = raw.trim()
-    const opens = (cleaned.match(/\{/g) || []).length
-    const closes = (cleaned.match(/\}/g) || []).length
-    if (opens > closes) cleaned += "}".repeat(opens - closes)
-    const obj = JSON.parse(cleaned)
-    if (obj.tool && typeof obj.tool === "string") return { tool: obj.tool, parameters: obj.parameters ?? {} }
-    if (obj.name && typeof obj.name === "string") return { tool: obj.name, parameters: obj.arguments ?? {} }
-    return null
-  } catch { return null }
-}
-
 async function proxyStream(
   c: any,
   type: WebProviderType,
@@ -446,10 +224,11 @@ async function proxyStream(
         log.info(`[WebChat] ${type} response received, starting parse...`)
 
         if (hasTools) {
-          await proxyStreamWithTools(controller, encoder, id, type, body, tools, (t) => { content += t })
+          await proxyStreamWithTools(controller, encoder, id, type, creds, model, body, tools, (t) => { content += t })
         } else {
           let textCount = 0
           for await (const chunk of parseProviderSSE(type, body)) {
+            trackProviderState(type, creds, model, chunk)
             if (chunk.thinking) {
               safeEnqueue(sseChunk({ id, choices: [{ index: 0, delta: { content: chunk.thinking }, finish_reason: null }] }))
             }
@@ -492,136 +271,76 @@ async function proxyStreamWithTools(
   encoder: TextEncoder,
   id: string,
   type: WebProviderType,
+  creds: Pick<WebAuthCredentials, "bearer" | "cookie">,
+  model: string | undefined,
   body: ReadableStream<Uint8Array>,
   _tools: any[],
   onText: (t: string) => void,
 ) {
-  const decoder = new TextDecoder()
-  const reader = body.getReader()
-  let buffer = ""
-  let tagBuffer = ""
   let accumulatedText = ""
   const hasTools = _tools && _tools.length > 0
-  let inToolCall = false
-  let toolIndex = 0
+  let toolState = createWebToolStreamState()
   let toolCallEmitted = false
-  let currentTid = ""
 
   const flushText = (text: string) => {
     if (!text) return
     onText(text)
-    controller.enqueue(encoder.encode(sseChunk({ id, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })))
+    controller.enqueue(encoder.encode(sseChunk(createTextDeltaChunk(id, text))))
   }
 
   const emitToolStart = (name: string, tid: string) => {
     if (toolCallEmitted) return
     toolCallEmitted = true
-    currentTid = tid
-    controller.enqueue(encoder.encode(sseChunk({
-      id, choices: [{
-        index: 0, delta: {
-          role: "assistant",
-          tool_calls: [{ index: toolIndex, id: tid, type: "function", function: { name, arguments: "" } }]
-        }, finish_reason: null
-      }]
-    })))
+    controller.enqueue(encoder.encode(sseChunk(createToolCallStartChunk(id, toolState.toolIndex, name, tid))))
   }
 
   const emitToolDelta = (delta: string) => {
     if (!toolCallEmitted) return
-    controller.enqueue(encoder.encode(sseChunk({
-      id, choices: [{
-        index: 0, delta: {
-          tool_calls: [{ index: toolIndex, delta: { arguments: delta } }]
-        }, finish_reason: null
-      }]
-    })))
+    controller.enqueue(encoder.encode(sseChunk(createToolCallArgumentsChunk(id, toolState.toolIndex, delta))))
   }
 
   const emitFullToolCall = (tc: ParsedToolCall) => {
     if (toolCallEmitted) return
-    const tid = `call_${Date.now()}_${toolIndex}`
-    emitToolStart(tc.tool, tid)
-    emitToolDelta(JSON.stringify(tc.parameters))
+    toolCallEmitted = true
+    for (const chunk of createFullToolCallChunks(id, toolState.toolIndex, tc)) {
+      controller.enqueue(encoder.encode(sseChunk(chunk)))
+    }
   }
 
-  const checkTags = () => {
-    const startMatch = tagBuffer.match(/<tool_call\s*(?:id=['"]?([^'"]+)['"]?\s*)?name=['"]?([^'"]+)['"]?\s*>/i)
-    const endMatch = tagBuffer.match(/<\/tool_call\s*>/i)
-    const indices: Array<{ type: string; idx: number; len: number; id?: string; name?: string }> = []
-    if (startMatch) indices.push({ type: "start", idx: startMatch.index!, len: startMatch[0].length, id: startMatch[1], name: startMatch[2] })
-    if (endMatch) indices.push({ type: "end", idx: endMatch.index!, len: endMatch[0].length })
-    if (indices.length === 0) return
-
-    indices.sort((a, b) => a.idx - b.idx)
-    const first = indices[0]
-    const before = tagBuffer.slice(0, first.idx)
-    tagBuffer = tagBuffer.slice(first.idx + first.len)
-
-    if (before) {
-      if (inToolCall) emitToolDelta(before)
-      else flushText(before)
-    }
-
-    if (first.type === "start") {
-      inToolCall = true
-      toolIndex++
-      const tid = first.id || `call_${Date.now()}_${toolIndex}`
-      emitToolStart(first.name!, tid)
+  for await (const chunk of parseProviderSSE(type, body)) {
+    trackProviderState(type, creds, model, chunk)
+    const text = chunk.text
+    if (!text) continue
+    accumulatedText += text
+    if (hasTools) {
+      const result = consumeWebToolStreamChunk(toolState, text)
+      toolState = result.state
+      for (const event of result.events) {
+        if (event.type === "text") flushText(event.text)
+        if (event.type === "tool-args") emitToolDelta(event.text)
+        if (event.type === "tool-start") {
+          toolState = { ...toolState, toolIndex: event.toolIndex }
+          emitToolStart(event.toolName, event.toolCallID)
+        }
+      }
     } else {
-      inToolCall = false
+      flushText(text)
     }
   }
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split("\n")
-      buffer = lines.pop() ?? ""
+  const flushed = flushWebToolStreamState(toolState)
+  toolState = flushed.state
+  for (const event of flushed.events) {
+    if (event.type === "text") flushText(event.text)
+    if (event.type === "tool-args") emitToolDelta(event.text)
+  }
 
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue
-        const data = line.slice(6).trim()
-        if (!data || data === "[DONE]") continue
-        try {
-          const parsed = JSON.parse(data)
-          const text = extractTextFromEvent(type, parsed)
-          if (text) {
-            accumulatedText += text
-            if (hasTools) {
-              tagBuffer += text
-              checkTags()
-              const lastAngle = tagBuffer.lastIndexOf("<")
-              if (lastAngle <= 0) {
-                const safe = lastAngle === 0 ? "" : tagBuffer.slice(0, lastAngle)
-                if (inToolCall) emitToolDelta(safe)
-                else flushText(safe)
-                tagBuffer = lastAngle === 0 ? "<" : tagBuffer.slice(lastAngle)
-              }
-            } else {
-              flushText(text)
-            }
-          }
-        } catch { /* skip */ }
-      }
+  if (hasTools && !toolCallEmitted && accumulatedText.length > 10) {
+    const tc = resolveToolCallOutput(accumulatedText, true)
+    if (tc) {
+      log.info(`[WebChat] ${type} found tool call via extractToolCall: ${tc.tool}`)
+      emitFullToolCall(tc)
     }
-
-    if (tagBuffer) {
-      if (inToolCall) emitToolDelta(tagBuffer)
-      else flushText(tagBuffer)
-    }
-
-    if (hasTools && !toolCallEmitted && accumulatedText.length > 10) {
-      const tc = extractToolCall(accumulatedText)
-      if (tc) {
-        log.info(`[WebChat] ${type} found tool call via extractToolCall: ${tc.tool}`)
-        emitFullToolCall(tc)
-      }
-    }
-  } finally {
-    reader.releaseLock()
   }
 }
 
@@ -637,27 +356,18 @@ async function proxyNonStream(
 
   const texts: string[] = []
   for await (const chunk of parseProviderSSE(type, body)) {
+    trackProviderState(type, creds, model, chunk)
     if (chunk.text) texts.push(chunk.text)
     if (chunk.thinking) texts.push(chunk.thinking)
   }
   const fullText = texts.join("")
 
-  const choices: any[] = []
-  if (tools?.length && !EXCLUDED_FROM_TOOLS.has(type)) {
-    const tc = extractToolCall(fullText)
-    if (tc) {
-      log.info(`[WebChat] ${type} non-stream tool call found: ${tc.tool}`)
-      choices.push({
-        index: 0,
-        message: { role: "assistant", content: null, tool_calls: [{ id: `call_${Date.now()}`, type: "function", function: { name: tc.tool, arguments: JSON.stringify(tc.parameters) } }] },
-        finish_reason: "tool_calls",
-      })
-    } else {
-      choices.push({ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" })
-    }
-  } else {
-    choices.push({ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop" })
+  const canUseTools = tools?.length > 0 && shouldInjectToolPrompt(type)
+  const toolCall = resolveToolCallOutput(fullText, canUseTools)
+  if (toolCall) {
+    log.info(`[WebChat] ${type} non-stream tool call found: ${toolCall.tool}`)
   }
+  const choices = [createNonStreamChoice(fullText, canUseTools)]
 
   return {
     id: `chatcmpl-${Date.now()}`,
@@ -674,14 +384,19 @@ async function callProvider(
   creds: WebAuthCredentials,
   message: string,
   model: string,
-  tools?: any,
 ): Promise<ReadableStream<Uint8Array>> {
   switch (type) {
     case "deepseek-web": {
       const client = new DeepSeekWebClient({ cookie: creds.cookie, bearer: creds.bearer, userAgent: creds.userAgent })
       await client.init()
-      const session = await client.createChatSession()
-      return client.chatCompletions({ sessionId: session.chat_session_id, message, model })
+      const state = getDeepSeekConversationState(creds, model)
+      const sessionID = state.sessionID ?? await createDeepSeekSession(client, creds, model)
+      return client.chatCompletions({
+        sessionId: sessionID,
+        parentMessageId: state.parentMessageID,
+        message,
+        model,
+      })
     }
     case "doubao-web": {
       const client = new DoubaoWebClient({ cookie: creds.cookie, userAgent: creds.userAgent })
@@ -748,53 +463,69 @@ async function callProvider(
   }
 }
 
-function extractTextFromEvent(type: WebProviderType, parsed: any): string {
-  switch (type) {
-    case "deepseek-web":
-    case "doubao-web":
-    case "qwen-web":
-    case "kimi-web":
-    case "glm-web": {
-      if (parsed.choices?.[0]?.delta?.content) return parsed.choices[0].delta.content
-      else if (parsed.v && !parsed.p?.includes("reasoning")) return parsed.v
-      else if (parsed.content) return parsed.content
-      break
-    }
-    case "claude-web": {
-      if (parsed.completion) return parsed.completion
-      else if (parsed.delta?.text) return parsed.delta.text
-      break
-    }
-    case "chatgpt-web": {
-      const c = parsed.message?.content?.parts?.[0]
-      if (typeof c === "string") return c
-      break
-    }
-    case "gemini-web": {
-      if (parsed.text) return parsed.text
-      if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) return parsed.candidates[0].content.parts[0].text
-      break
-    }
-    case "grok-web": {
-      if (parsed.contentDelta) return parsed.contentDelta
-      if (parsed.text) return parsed.text
-      if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) return parsed.candidates[0].content.parts[0].text
-      break
-    }
-  }
-  return ""
+async function createDeepSeekSession(
+  client: DeepSeekWebClient,
+  creds: Pick<WebAuthCredentials, "bearer" | "cookie">,
+  model?: string,
+) {
+  const session = await client.createChatSession()
+  setDeepSeekSessionID(creds, model, session.chat_session_id)
+  return session.chat_session_id
 }
 
-async function* parseProviderSSE(type: WebProviderType, stream: ReadableStream<Uint8Array>): AsyncGenerator<{ text?: string; thinking?: string }> {
+function trackProviderState(
+  type: WebProviderType,
+  creds: Pick<WebAuthCredentials, "bearer" | "cookie">,
+  model: string | undefined,
+  chunk: ParsedProviderChunk,
+) {
+  if (type !== "deepseek-web") return
+  if (typeof chunk.messageID === "undefined") return
+  setDeepSeekParentMessageID(creds, model, chunk.messageID)
+}
+
+async function* parseProviderSSE(type: WebProviderType, stream: ReadableStream<Uint8Array>): AsyncGenerator<ParsedProviderChunk> {
+  if (type === "deepseek-web") {
+    yield* parseDeepSeekProviderSSE(stream)
+    return
+  }
+
+  if (type === "doubao-web") {
+    yield* parseDoubaoProviderSSE(stream)
+    return
+  }
+
+  if (type === "xiaomimo-web") {
+    yield* parseXiaomiMimoProviderSSE(stream)
+    return
+  }
+
+  if (
+    type === "qwen-web" ||
+    type === "qwen-cn-web" ||
+    type === "glm-web" ||
+    type === "glm-intl-web" ||
+    type === "gemini-web" ||
+    type === "grok-web" ||
+    type === "perplexity-web"
+  ) {
+    for await (const text of parseGenericWebSSE(stream)) {
+      yield { text }
+    }
+    return
+  }
+
+  if (type === "kimi-web") {
+    for await (const text of parseKimiConnectStream(stream)) {
+      yield { text }
+    }
+    return
+  }
+
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
   let chatgptAccumulated = ""
-  let grokAccumulated = ""
-  let qwenCnAccumulated = ""
-  let glmAccumulated = ""
-  let mimoAccumulated = ""
-  let mimoInsideThink = false
 
   try {
     while (true) {
@@ -814,8 +545,6 @@ async function* parseProviderSSE(type: WebProviderType, stream: ReadableStream<U
         if (trimmed.startsWith("data:")) {
           const colonIdx = trimmed.indexOf(":")
           data = trimmed.slice(colonIdx + 1).trim()
-        } else if (type === "grok-web") {
-          data = trimmed
         } else {
           continue
         }
@@ -825,119 +554,6 @@ async function* parseProviderSSE(type: WebProviderType, stream: ReadableStream<U
           const parsed = JSON.parse(data)
 
           switch (type) {
-            case "deepseek-web": {
-              if ((parsed.p?.includes("reasoning") || parsed.type === "thinking") && typeof parsed.v === "string") {
-                yield { thinking: parsed.v }
-              } else if (parsed.type === "thinking" && typeof parsed.content === "string") {
-                yield { thinking: parsed.content }
-              } else if (typeof parsed.v === "string" && (!parsed.p || parsed.p.includes("content") || parsed.p.includes("choices"))) {
-                yield { text: parsed.v }
-              } else if (parsed.type === "text" && typeof parsed.content === "string") {
-                yield { text: parsed.content }
-              } else if (Array.isArray(parsed.v)) {
-                for (const frag of parsed.v) {
-                  if (frag.type === "THINKING" || frag.type === "reasoning") yield { thinking: frag.content || "" }
-                  else if (frag.content) yield { text: frag.content }
-                }
-              } else if (parsed.choices?.[0]) {
-                if (parsed.choices[0].delta?.reasoning_content) yield { thinking: parsed.choices[0].delta.reasoning_content }
-                if (parsed.choices[0].delta?.content) yield { text: parsed.choices[0].delta.content }
-              }
-              break
-            }
-            case "doubao-web": {
-              let delta = ""
-              if (parsed.event_data) {
-                let eventData = parsed.event_data
-                if (typeof eventData === "string") {
-                  try { eventData = JSON.parse(eventData) } catch { eventData = {} }
-                }
-                if (parsed.event_type === 2001) {
-                  const msgContent = eventData?.message?.content
-                  if (typeof msgContent === "string") {
-                    try {
-                      const contentObj = JSON.parse(msgContent)
-                      delta = typeof contentObj.text === "string" ? contentObj.text : ""
-                    } catch { delta = msgContent }
-                  }
-                } else if (parsed.event_type === 2003) {
-                  delta = eventData.text || eventData.content || eventData.delta || ""
-                }
-              }
-              if (!delta) delta = parsed.choices?.[0]?.delta?.content ?? parsed.v ?? parsed.text ?? parsed.content ?? parsed.delta ?? ""
-              if (delta) {
-                if (parsed.p?.includes("reasoning")) yield { thinking: delta }
-                else yield { text: delta }
-              }
-              break
-            }
-            case "qwen-web": {
-              const delta = parsed.choices?.[0]?.delta
-              if (delta?.reasoning_content) yield { thinking: delta.reasoning_content }
-              if (delta?.content) yield { text: delta.content }
-              else if (parsed.text) yield { text: parsed.text }
-              else if (parsed.content) yield { text: parsed.content }
-              break
-            }
-            case "qwen-cn-web": {
-              let delta = ""
-              if (parsed.data?.messages && Array.isArray(parsed.data.messages)) {
-                for (let i = parsed.data.messages.length - 1; i >= 0; i--) {
-                  const msg = parsed.data.messages[i]
-                  if (msg.content && typeof msg.content === "string") {
-                    delta = msg.content
-                    break
-                  }
-                }
-              }
-              if (!delta) {
-                const d = parsed.choices?.[0]?.delta
-                if (d?.reasoning_content) { yield { thinking: d.reasoning_content } }
-                if (d?.content) delta = d.content
-              }
-              if (!delta) delta = parsed.data?.text ?? parsed.data?.content ?? parsed.communication?.text ?? parsed.text ?? parsed.content ?? ""
-              if (typeof delta === "string" && delta) {
-                if (delta.length > qwenCnAccumulated.length && delta.startsWith(qwenCnAccumulated)) {
-                  const newPart = delta.slice(qwenCnAccumulated.length)
-                  qwenCnAccumulated = delta
-                  if (newPart) yield { text: newPart }
-                } else if (delta !== qwenCnAccumulated) {
-                  qwenCnAccumulated = delta
-                  yield { text: delta }
-                }
-              }
-              break
-            }
-            case "kimi-web": {
-              if (parsed.type === "thinking" && typeof parsed.content === "string") yield { thinking: parsed.content }
-              else if (parsed.text) yield { text: parsed.text }
-              else if (parsed.content && typeof parsed.content === "string") yield { text: parsed.content }
-              else if (parsed.choices?.[0]?.delta?.content) yield { text: parsed.choices[0].delta.content }
-              break
-            }
-            case "glm-web":
-            case "glm-intl-web": {
-              let delta = ""
-              if (parsed.parts && Array.isArray(parsed.parts)) {
-                for (const part of parsed.parts) {
-                  if (part?.content && Array.isArray(part.content)) {
-                    for (const c of part.content) {
-                      if (c?.type === "text" && typeof c.text === "string") { delta = c.text; break }
-                    }
-                  }
-                  if (delta) break
-                }
-              }
-              if (!delta) delta = parsed.text || parsed.content || parsed.delta || parsed.message || ""
-              if (typeof delta === "string" && delta) {
-                if (delta.length > glmAccumulated.length) {
-                  const newDelta = delta.slice(glmAccumulated.length)
-                  glmAccumulated = delta
-                  if (newDelta) yield { text: newDelta }
-                }
-              }
-              break
-            }
             case "claude-web": {
               if (parsed.completion) yield { text: parsed.completion }
               else if (parsed.delta?.text) yield { text: parsed.delta.text }
@@ -956,60 +572,6 @@ async function* parseProviderSSE(type: WebProviderType, stream: ReadableStream<U
                 if (delta) {
                   chatgptAccumulated = content
                   yield { text: delta }
-                }
-              }
-              break
-            }
-            case "gemini-web": {
-              if (parsed.text) yield { text: parsed.text }
-              else if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) yield { text: parsed.candidates[0].content.parts[0].text }
-              break
-            }
-            case "grok-web": {
-              const raw = parsed.contentDelta ?? parsed.textDelta ?? parsed.text ?? parsed.content ?? parsed.delta
-              if (typeof raw === "string" && raw) {
-                if (raw.length > grokAccumulated.length && raw.startsWith(grokAccumulated)) {
-                  const newDelta = raw.slice(grokAccumulated.length)
-                  grokAccumulated = raw
-                  if (newDelta) yield { text: newDelta }
-                } else if (raw !== grokAccumulated) {
-                  grokAccumulated = raw
-                  yield { text: raw }
-                }
-              } else if (parsed.candidates?.[0]?.content?.parts?.[0]?.text) {
-                yield { text: parsed.candidates[0].content.parts[0].text }
-              }
-              break
-            }
-            case "perplexity-web": {
-              if (parsed.text) yield { text: parsed.text }
-              else if (parsed.content) yield { text: typeof parsed.content === "string" ? parsed.content : JSON.stringify(parsed.content) }
-              else if (parsed.choices?.[0]?.delta?.content) yield { text: parsed.choices[0].delta.content }
-              break
-            }
-            case "xiaomimo-web": {
-              if (parsed.content && typeof parsed.content === "string") {
-                let content = parsed.content
-                if (content.includes("<think")) mimoInsideThink = true
-                if (mimoInsideThink) {
-                  const thinkEnd = content.indexOf("</think")
-                  if (thinkEnd !== -1) {
-                    content = content.slice(thinkEnd + 8)
-                    mimoInsideThink = false
-                  } else {
-                    break
-                  }
-                }
-                content = content.replace(/\x00/g, "")
-                if (content) yield { text: content }
-                break
-              }
-              const delta = parsed.choices?.[0]?.delta?.content ?? parsed.text ?? parsed.delta
-              if (typeof delta === "string" && delta) {
-                if (delta.length > mimoAccumulated.length) {
-                  const newDelta = delta.slice(mimoAccumulated.length)
-                  mimoAccumulated = delta
-                  if (newDelta) yield { text: newDelta }
                 }
               }
               break

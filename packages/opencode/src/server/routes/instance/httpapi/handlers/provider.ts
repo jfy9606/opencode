@@ -2,6 +2,7 @@ import { ProviderAuth } from "@/provider/auth"
 import { Config } from "@/config/config"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Provider } from "@/provider/provider"
+import { WEB_PROVIDERS } from "@/provider/web"
 
 import { mapValues } from "remeda"
 import { Effect, Schema } from "effect"
@@ -51,6 +52,11 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
         mapValues(filtered, (item) => Provider.fromModelsDevProvider(item)),
         connected,
       )
+      for (const [id, webProvider] of Object.entries(WEB_PROVIDERS)) {
+        if ((enabled ? enabled.has(id) : true) && !disabled.has(id) && !(id in providers)) {
+          providers[ProviderV2.ID.make(id)] = Provider.fromWebProvider(id, webProvider)
+        }
+      }
       return {
         all: Object.values(providers).map(Provider.toPublicInfo),
         default: Provider.defaultModelIDs(providers),

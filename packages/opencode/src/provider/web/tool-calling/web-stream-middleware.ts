@@ -88,12 +88,16 @@ function needsToolInjection(message: string): boolean {
  * Check if tool calling should be enabled for a given message and API.
  * Returns the tool prompt if injection is needed, null otherwise.
  */
-export function evaluateToolInjection(userMessage: string, api: string, hasAgentTools: boolean): string | null {
+export function evaluateToolInjection(
+  userMessage: string,
+  api: string,
+  tools: unknown[],
+) {
   if (!shouldInjectToolPrompt(api)) return null
-  if (!hasAgentTools) return null
+  if (!tools.length) return null
   if (!needsToolInjection(userMessage)) return null
 
-  return getToolPrompt(api)
+  return getToolPrompt(api, tools)
 }
 
 /**

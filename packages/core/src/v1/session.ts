@@ -5,12 +5,15 @@ import { EventV2 } from "../event"
 import { PermissionV1 } from "./permission"
 import { ProjectV2 } from "../project"
 import { ProviderV2 } from "../provider"
+import { ModelV2 } from "../model"
 import { optionalOmitUndefined, withStatics } from "../schema"
 import { Identifier } from "../util/identifier"
 import { NonNegativeInt } from "../schema"
 import { NamedError } from "../util/error"
 import { SessionSchema } from "../session/schema"
 import { WorkspaceV2 } from "../workspace"
+
+const Timestamp = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
 
 export const MessageID = Schema.String.check(Schema.isStartsWith("msg")).pipe(
   Schema.brand("MessageID"),
@@ -48,6 +51,9 @@ export type APIError = Schema.Schema.Type<typeof APIError.Schema>
 export const ContextOverflowError = NamedError.create("ContextOverflowError", {
   message: Schema.String,
   responseBody: Schema.optional(Schema.String),
+})
+export const ContentFilterError = NamedError.create("ContentFilterError", {
+  message: Schema.String,
 })
 
 export class OutputFormatText extends Schema.Class<OutputFormatText>("OutputFormatText")({
@@ -198,7 +204,7 @@ export const SubtaskPart = Schema.Struct({
   model: Schema.optional(
     Schema.Struct({
       providerID: ProviderV2.ID,
-      modelID: ProviderV2.ModelID,
+      modelID: ModelV2.ID,
     }),
   ),
   command: Schema.optional(Schema.String),
@@ -329,7 +335,7 @@ export const User = Schema.Struct({
   ...messageBase,
   role: Schema.Literal("user"),
   time: Schema.Struct({
-    created: NonNegativeInt,
+    created: Timestamp,
   }),
   format: Schema.optional(Format),
   summary: Schema.optional(
@@ -342,7 +348,7 @@ export const User = Schema.Struct({
   agent: Schema.String,
   model: Schema.Struct({
     providerID: ProviderV2.ID,
-    modelID: ProviderV2.ModelID,
+    modelID: ModelV2.ID,
     variant: Schema.optional(Schema.String),
   }),
   system: Schema.optional(Schema.String),
@@ -385,6 +391,7 @@ const AssistantErrorSchema = Schema.Union([
   AbortedError.EffectSchema,
   StructuredOutputError.EffectSchema,
   ContextOverflowError.EffectSchema,
+  ContentFilterError.EffectSchema,
   APIError.EffectSchema,
 ]).annotate({ discriminator: "name" })
 type AssistantError = Schema.Schema.Type<typeof AssistantErrorSchema>
@@ -438,7 +445,7 @@ export const SubtaskPartInput = Schema.Struct({
   model: Schema.optional(
     Schema.Struct({
       providerID: ProviderV2.ID,
-      modelID: ProviderV2.ModelID,
+      modelID: ModelV2.ID,
     }),
   ),
   command: Schema.optional(Schema.String),
@@ -454,7 +461,7 @@ export const Assistant = Schema.Struct({
   }),
   error: Schema.optional(AssistantErrorSchema),
   parentID: MessageID,
-  modelID: ProviderV2.ModelID,
+  modelID: ModelV2.ID,
   providerID: ProviderV2.ID,
   mode: Schema.String,
   agent: Schema.String,
@@ -495,7 +502,7 @@ export type WithParts = {
 }
 
 const options = {
-  sync: {
+  durable: {
     aggregate: "sessionID",
     version: 1,
   },
@@ -530,7 +537,7 @@ const SessionRevert = Schema.Struct({
 })
 
 const SessionModel = Schema.Struct({
-  id: ProviderV2.ModelID,
+  id: ModelV2.ID,
   providerID: ProviderV2.ID,
   variant: optionalOmitUndefined(Schema.String),
 })
