@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Effect, Schedule, Schema } from "effect"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -16,7 +16,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 
 const providerID = ProviderV2.ID.make("test")
 const retryProvider = "test"
-const it = testEffect(LayerNode.buildLayer(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
+const it = testEffect(LayerNode.compile(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
 
 function apiError(headers?: Record<string, string>): SessionV1.APIError {
   return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
@@ -118,14 +118,19 @@ describe("session.retry.delay", () => {
 })
 
 describe("session.retry.retryable", () => {
-  test("maps too_many_requests json messages", () => {
+  test("retries serialized too_many_requests messages", () => {
     const error = wrap(JSON.stringify({ type: "error", error: { type: "too_many_requests" } }))
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Too Many Requests" })
   })
 
-  test("maps overloaded provider codes", () => {
+  test("retries serialized overloaded provider codes", () => {
     const error = wrap(JSON.stringify({ code: "resource_exhausted" }))
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Provider is overloaded" })
+  })
+
+  test("retries serialized rate_limit messages", () => {
+    const message = JSON.stringify({ type: "error", error: { code: "rate_limit_exceeded" } })
+    expect(SessionRetry.retryable(wrap(message), retryProvider)).toEqual({ message })
   })
 
   test("does not retry unknown json messages", () => {
@@ -161,6 +166,45 @@ describe("session.retry.retryable", () => {
     const msg = "Too many requests, please slow down"
     const error = wrap(msg)
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: msg })
+  })
+
+  test.each([
+    "Internal server error",
+    "internal error",
+    "server-error",
+    "Provider returned error",
+    "provider-returned-error",
+    "terminated",
+    "fetch failed",
+    "connection refused",
+    "connect ECONNREFUSED",
+    "request ETIMEDOUT",
+    "failed to fetch",
+    "EAI_AGAIN",
+    "response timed out",
+    "Please retry your request",
+    "try your request again",
+    "upstream returned status 524",
+  ])("retries matching API error text: %s", (message) => {
+    expect(SessionRetry.retryable(wrap(message), retryProvider)).toEqual({ message })
+  })
+
+  test("retries hyphenated service-unavailable errors", () => {
+    expect(SessionRetry.retryable(wrap("service-unavailable"), retryProvider)).toEqual({
+      message: "Provider is overloaded",
+    })
+  })
+
+  test("matches retryable API response bodies", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Request failed",
+        isRetryable: false,
+        statusCode: 400,
+        responseBody: JSON.stringify({ error: { message: "upstream connection refused" } }),
+      }).toObject(),
+    )
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Request failed" })
   })
 
   test("retries transport timeout errors", () => {
