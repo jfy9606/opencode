@@ -1,7 +1,7 @@
 import { ChatGPTWebClient } from "../clients/chatgpt-web-client.js"
 import type { WebAuthCredentials } from "../types.js"
 
-export function createChatGPTWebStream(credentials: WebAuthCredentials | string) {
+export function createChatGPTWebStream(credentials: WebAuthCredentials) {
   const client = new ChatGPTWebClient(credentials)
 
   return async (params: { message: string; model?: string; signal?: AbortSignal }) => {

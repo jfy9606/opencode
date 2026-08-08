@@ -4,7 +4,7 @@ import type { WebAuthCredentials } from "../types.js"
 const sessionMap = new Map<string, string>()
 const parentMap = new Map<string, string | number>()
 
-export function createDeepSeekWebStream(credentials: WebAuthCredentials | string) {
+export function createDeepSeekWebStream(credentials: WebAuthCredentials) {
   const client = new DeepSeekWebClient(credentials)
 
   return async function*(params: { message: string; model?: string; signal?: AbortSignal }) {

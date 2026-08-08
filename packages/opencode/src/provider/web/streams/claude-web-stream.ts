@@ -1,7 +1,7 @@
 import { ClaudeWebClient } from "../clients/claude-web-client.js"
 import type { WebAuthCredentials } from "../types.js"
 
-export function createClaudeWebStream(credentials: WebAuthCredentials | string) {
+export function createClaudeWebStream(credentials: WebAuthCredentials) {
   const client = new ClaudeWebClient(credentials)
 
   return async (params: { message: string; model?: string; signal?: AbortSignal }) => {

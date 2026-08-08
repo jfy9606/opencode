@@ -2,8 +2,7 @@ import { Hono } from "hono"
 import { describeRoute, validator, resolver } from "hono-openapi"
 import z from "zod"
 import { streamSSE } from "hono/streaming"
-import { Auth } from "../auth"
-import { ProviderID } from "../schema"
+import { authGet, authSet } from "./auth"
 import { WEB_PROVIDERS, loginWebProvider } from "./index"
 import type { WebProviderType, WebAuthCredentials } from "./types"
 import { DeepSeekWebClient } from "./clients/deepseek-web-client"
@@ -28,11 +27,9 @@ import { shouldInjectToolPrompt } from "./tool-calling/web-tool-prompt"
 import { parseGenericWebSSE } from "./streams/generic-web-stream"
 import { parseKimiConnectStream } from "./streams/kimi-web-stream"
 import { parseDeepSeekProviderSSE, parseDoubaoProviderSSE, parseXiaomiMimoProviderSSE, type ParsedProviderChunk } from "./streams/special-web-parsers"
-import { errors } from "../../server/error"
+import { errors } from "./errors"
 import { lazy } from "../../util/lazy"
-import { Log } from "../../util/log"
-
-const log = Log.create({ service: "server" })
+import { log } from "./log"
 
 export const WebProviderRoutes = lazy(() =>
   new Hono()
@@ -70,7 +67,7 @@ export const WebProviderRoutes = lazy(() =>
       validator(
         "param",
         z.object({
-          providerID: ProviderID.zod.meta({ description: "Provider ID (e.g. gemini-web)" }),
+          providerID: z.string().describe("Provider ID (e.g. gemini-web)"),
         }),
       ),
       async (c) => {
@@ -109,7 +106,7 @@ export const WebProviderRoutes = lazy(() =>
 
             await send("capturing", "Capturing session credentials...")
 
-            await Auth.set(providerID, { type: "api", key: JSON.stringify(creds) })
+            await authSet(providerID, { type: "api", key: JSON.stringify(creds) })
 
             await send("success", "Authentication successful!", creds)
           } catch (e) {
@@ -132,7 +129,7 @@ export const WebProviderRoutes = lazy(() =>
         },
       }),
       validator("param", z.object({
-        providerID: ProviderID.zod.meta({ description: "Web Provider ID (e.g. gemini-web)" }),
+        providerID: z.string().describe("Web Provider ID (e.g. gemini-web)"),
       })),
       async (c) => {
         const providerID = c.req.valid("param").providerID
@@ -141,7 +138,7 @@ export const WebProviderRoutes = lazy(() =>
           return c.json({ error: { message: `Unknown web provider: ${providerID}`, type: "invalid_request_error" } }, 400)
         }
 
-        const auth = await Auth.get(providerID)
+        const auth = await authGet(providerID)
         if (!auth || auth.type !== "api" || !auth.key) {
           return c.json({ error: { message: "Not authenticated. Please connect this provider first.", type: "authentication_error" } }, 401)
         }
