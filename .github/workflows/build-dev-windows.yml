@@ -1,0 +1,67 @@
+name: build-dev-windows
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: build-dev-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      OPENCODE_CHANNEL: dev
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Build CLI from source (win32-x64)
+        run: |
+          ./script/build.ts --single
+        working-directory: packages/opencode
+
+      - name: Prepare desktop app
+        run: bun ./scripts/prepare.ts
+        working-directory: packages/desktop
+        env:
+          OPENCODE_CHANNEL: dev
+
+      - name: Embed dev-build CLI in desktop resources
+        shell: pwsh
+        run: |
+          Copy-Item `
+            "${{ github.workspace }}\packages\opencode\dist\opencode-windows-x64\bin\opencode.exe" `
+            "${{ github.workspace }}\packages\desktop\resources\opencode-cli.exe" `
+            -Force
+
+      - name: Build desktop app
+        run: bun run build
+        working-directory: packages/desktop
+        env:
+          OPENCODE_CHANNEL: dev
+
+      - name: Package MSI (win32-x64)
+        run: npx electron-builder --win msi --x64 --publish never --config electron-builder.config.ts
+        working-directory: packages/desktop
+        timeout-minutes: 60
+        env:
+          OPENCODE_CHANNEL: dev
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-cli-windows-x64
+          path: packages/opencode/dist/opencode-windows-x64
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-desktop-msi-x64
+          path: packages/desktop/dist/*.msi

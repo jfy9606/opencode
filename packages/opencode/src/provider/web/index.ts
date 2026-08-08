@@ -102,6 +102,22 @@ export const WEB_PROVIDERS: Record<
         contextWindow: 64_000,
         maxTokens: 8192,
       },
+      {
+        id: "deepseek-chat-search",
+        name: "DeepSeek V3 (Web + Search)",
+        reasoning: false,
+        input: ["text"],
+        contextWindow: 64_000,
+        maxTokens: 8192,
+      },
+      {
+        id: "deepseek-reasoner-search",
+        name: "DeepSeek R1 (Web + Search)",
+        reasoning: true,
+        input: ["text"],
+        contextWindow: 64_000,
+        maxTokens: 8192,
+      },
     ],
   },
   "doubao-web": {
