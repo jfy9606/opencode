@@ -14,7 +14,24 @@ permissions:
   contents: read
 
 jobs:
+  build-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Build CLI (win32-x64)
+        run: bun ./script/build.ts
+        working-directory: packages/opencode
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-cli-windows
+          path: packages/opencode/dist/opencode-windows*
+
   build:
+    needs: build-cli
     runs-on: windows-latest
     env:
       OPENCODE_CHANNEL: dev
@@ -24,15 +41,14 @@ jobs:
 
       - uses: ./.github/actions/setup-bun
 
-      - name: Build CLI from source (win32-x64)
-        run: bun ./script/build.ts --single
-        working-directory: packages/opencode
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: opencode-cli-windows
+          path: packages/opencode/dist
 
       - name: Prepare desktop app
         run: bun ./scripts/prepare.ts
         working-directory: packages/desktop
-        env:
-          OPENCODE_CHANNEL: dev
 
       - name: Embed dev-build CLI in desktop resources
         shell: pwsh
