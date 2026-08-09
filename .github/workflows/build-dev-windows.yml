@@ -25,8 +25,7 @@ jobs:
       - uses: ./.github/actions/setup-bun
 
       - name: Build CLI from source (win32-x64)
-        run: |
-          ./script/build.ts --single
+        run: bun ./script/build.ts --single
         working-directory: packages/opencode
 
       - name: Prepare desktop app
