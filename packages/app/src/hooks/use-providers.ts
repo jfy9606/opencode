@@ -54,6 +54,7 @@ export function useProviders(directory: Accessor<string | undefined>) {
   return {
     all: () => providers().all,
     default: () => providers().default,
+    defaultModel: () => providers().defaultModel,
     popular: () =>
       pipe(
         providers().all,
