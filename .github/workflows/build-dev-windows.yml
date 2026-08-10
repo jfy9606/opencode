@@ -17,7 +17,6 @@ permissions:
 
 jobs:
   ensure-no-extra-workflows:
-    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -32,6 +31,22 @@ jobs:
               await github.rest.actions.disableWorkflow({ owner: context.repo.owner, repo: context.repo.repo, workflow_id: workflow.id })
             }
             console.log(`checked ${data.workflows.length} workflows`)
+            for (const status of ["queued", "in_progress"]) {
+              for (let page = 1; ; page++) {
+                const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner: context.repo.owner, repo: context.repo.repo, status, per_page: 100, page })
+                for (const run of runs.data.workflow_runs) {
+                  if (run.name === "build-dev-windows") continue
+                  try {
+                    console.log(`cancelling ${run.name} run ${run.id} (${run.event})`)
+                    await github.rest.actions.cancelWorkflowRun({ owner: context.repo.owner, repo: context.repo.repo, run_id: run.id })
+                  } catch (error) {
+                    console.log(`cancel ${run.id} failed: ${error.status}`)
+                  }
+                }
+                if (runs.data.workflow_runs.length < 100) break
+              }
+            }
+            console.log("cancelled stray runs")
 
   build-cli:
     if: github.event_name != 'schedule'
